@@ -29,7 +29,7 @@ Quick start
 """
 
 from .config     import GWFConfig
-from .data       import get_dataloaders, SpatialRegressionDataset
+from .data       import get_dataloaders, SpatialRegressionDataset, load_custom_dataset
 from .encoders   import GeoCLIPEncoder, SatCLIPEncoder, LocationFusion
 from .kernel     import DynamicKernelGenerator
 from .regression import MatrixGWR
@@ -38,6 +38,7 @@ from .model      import GWF, InContextEncoder
 __all__ = [
     "GWFConfig",
     "get_dataloaders",
+    "load_custom_dataset",
     "SpatialRegressionDataset",
     "GeoCLIPEncoder",
     "SatCLIPEncoder",

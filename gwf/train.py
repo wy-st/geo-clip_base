@@ -49,7 +49,10 @@ def r2(y_hat: torch.Tensor, y: torch.Tensor) -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def train(cfg: GWFConfig, source: str = "synthetic",
-          visualise: bool = False, device: str = "cpu"):
+          visualise: bool = False, device: str = "cpu",
+          csv_path: str | None = None,
+          lat_col: str = "lat", lon_col: str = "lon",
+          target_col: str = "price", feature_cols: list | None = None):
 
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -65,7 +68,12 @@ def train(cfg: GWFConfig, source: str = "synthetic",
         val_split=cfg.val_split,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
-        n_samples=cfg.n_samples)
+        n_samples=cfg.n_samples,
+        csv_path=csv_path,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        target_col=target_col,
+        feature_cols=feature_cols)
 
     cfg.feat_dim = feat_dim
     print(f"  feat_dim={feat_dim}  |  k={cfg.k_neighbors}  |  "
@@ -212,9 +220,32 @@ def _visualise_betas(model, val_dl, device, source):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser("GWF Training")
+    parser = argparse.ArgumentParser(
+        "GWF Training",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python -m gwf.train                                      # synthetic data
+  python -m gwf.train --source california                  # CA Housing
+  python -m gwf.train --source custom --csv housing.csv \\
+      --lat_col lat --lon_col lon --target price           # your own CSV
+  python -m gwf.train --source custom --csv housing.csv \\
+      --features area rooms age dist_subway --visualise    # select features
+""")
     parser.add_argument("--source",    default="synthetic",
-                        choices=["synthetic", "california"])
+                        choices=["synthetic", "california", "custom"])
+    # ── Custom dataset ────────────────────────────────────────────────────
+    parser.add_argument("--csv",        default=None,
+                        metavar="PATH",  help="path to your CSV file")
+    parser.add_argument("--lat_col",    default="lat",
+                        help="latitude column name  (default: lat)")
+    parser.add_argument("--lon_col",    default="lon",
+                        help="longitude column name (default: lon)")
+    parser.add_argument("--target",     default="price",
+                        metavar="COL",  help="target column name (default: price)")
+    parser.add_argument("--features",   nargs="+", default=None,
+                        metavar="COL",  help="feature columns (default: all except lat/lon/target)")
+    # ── Training hyper-params ─────────────────────────────────────────────
     parser.add_argument("--epochs",    type=int,   default=None)
     parser.add_argument("--lr",        type=float, default=None)
     parser.add_argument("--batch",     type=int,   default=None)
@@ -233,8 +264,15 @@ def main():
     if args.k         is not None: cfg.k_neighbors = args.k
     if args.n_samples is not None: cfg.n_samples   = args.n_samples
 
-    train(cfg, source=args.source,
-          visualise=args.visualise, device=args.device)
+    train(cfg,
+          source=args.source,
+          visualise=args.visualise,
+          device=args.device,
+          csv_path=args.csv,
+          lat_col=args.lat_col,
+          lon_col=args.lon_col,
+          target_col=args.target,
+          feature_cols=args.features)
 
 
 if __name__ == "__main__":

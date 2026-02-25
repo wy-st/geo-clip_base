@@ -97,6 +97,80 @@ def load_california_housing():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Custom dataset loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_custom_dataset(path: str,
+                        lat_col:    str = "lat",
+                        lon_col:    str = "lon",
+                        target_col: str = "price",
+                        feature_cols: list | None = None,
+                        standardize_y: bool = True):
+    """
+    Load your own CSV dataset into the format expected by GWF.
+
+    Parameters
+    ----------
+    path          : path to the CSV file
+    lat_col       : name of the latitude column  (decimal degrees)
+    lon_col       : name of the longitude column (decimal degrees)
+    target_col    : name of the column to predict
+    feature_cols  : list of feature column names to use as predictors.
+                    If None, uses ALL columns except lat, lon, and target.
+    standardize_y : whether to z-score normalise the target (recommended)
+
+    Returns
+    -------
+    coords : float32 ndarray (n, 2)  — [lat, lon]
+    X      : float32 ndarray (n, p)  — standardised tabular features
+    y      : float32 ndarray (n,)    — (optionally standardised) target
+
+    Example
+    -------
+    coords, X, y = load_custom_dataset(
+        "housing.csv",
+        lat_col="latitude",
+        lon_col="longitude",
+        target_col="price",
+        feature_cols=["area", "rooms", "age", "dist_subway"],
+    )
+    """
+    import pandas as pd
+
+    df = pd.read_csv(path)
+
+    # ── Coordinates ───────────────────────────────────────────────────────
+    coords = df[[lat_col, lon_col]].values.astype(np.float32)
+
+    # ── Feature columns ───────────────────────────────────────────────────
+    if feature_cols is None:
+        exclude = {lat_col, lon_col, target_col}
+        feature_cols = [c for c in df.columns if c not in exclude]
+
+    X_raw = df[feature_cols].values.astype(np.float64)
+
+    # Handle missing values: fill with column median
+    col_medians = np.nanmedian(X_raw, axis=0)
+    nan_mask = np.isnan(X_raw)
+    X_raw[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X_raw).astype(np.float32)
+
+    # ── Target ────────────────────────────────────────────────────────────
+    y = df[target_col].values.astype(np.float32)
+    if standardize_y:
+        y = ((y - y.mean()) / (y.std() + 1e-8))
+
+    print(f"[load_custom_dataset] n={len(y)}, p={X.shape[1]}, "
+          f"features={feature_cols}")
+    print(f"  lat ∈ [{coords[:,0].min():.3f}, {coords[:,0].max():.3f}]  "
+          f"lon ∈ [{coords[:,1].min():.3f}, {coords[:,1].max():.3f}]")
+
+    return coords, X, y.astype(np.float32)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # k-NN graph (precomputed, stored with dataset)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -161,16 +235,45 @@ class SpatialRegressionDataset(Dataset):
 
 
 def get_dataloaders(source="synthetic", k=16, val_split=0.2,
-                    batch_size=256, seed=42, n_samples=5000):
+                    batch_size=256, seed=42, n_samples=5000,
+                    # ── custom dataset options ──────────────────────────────
+                    csv_path: str | None = None,
+                    lat_col:    str = "lat",
+                    lon_col:    str = "lon",
+                    target_col: str = "price",
+                    feature_cols: list | None = None,
+                    coords: np.ndarray | None = None,
+                    X:      np.ndarray | None = None,
+                    y:      np.ndarray | None = None):
     """
     Build train/val DataLoaders.
 
     Parameters
     ----------
-    source : "synthetic" | "california"
+    source       : "synthetic" | "california" | "custom"
+                   Use "custom" when providing csv_path or arrays directly.
+    csv_path     : path to your CSV file (when source="custom")
+    lat_col      : latitude column name in your CSV
+    lon_col      : longitude column name in your CSV
+    target_col   : target column name in your CSV
+    feature_cols : list of feature column names; None = all except lat/lon/target
+    coords       : (n,2) float32 ndarray — pass arrays directly instead of CSV
+    X            : (n,p) float32 ndarray
+    y            : (n,)  float32 ndarray
     """
     if source == "california":
         coords, X, y = load_california_housing()
+    elif source == "custom":
+        if coords is not None and X is not None and y is not None:
+            # Arrays passed directly — use as-is
+            pass
+        elif csv_path is not None:
+            coords, X, y = load_custom_dataset(
+                csv_path, lat_col=lat_col, lon_col=lon_col,
+                target_col=target_col, feature_cols=feature_cols)
+        else:
+            raise ValueError(
+                "source='custom' requires either csv_path= or (coords, X, y) arrays.")
     else:
         coords, X, y = make_synthetic_spatial(n=n_samples, seed=seed)
 
