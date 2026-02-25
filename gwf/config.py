@@ -15,12 +15,17 @@ class GWFConfig:
     sat_emb_dim: int = 512         # SatCLIP-proxy output dim (same arch, diff sigma)
     loc_proj_dim: int = 256        # after fusing geo+sat  (1 linear layer)
 
+    # ── TabPFN in-context encoder (frozen pretrained transformer) ───────────
+    # feat_emb_dim is NOT set here; it is auto-detected from TabPFN's ninp
+    # at model construction time and stored in GWF.ctx_enc.emb_dim.
+    tabpfn_path: str | None = None  # local .ckpt path; None → HuggingFace download
+
     # ── Tabular features ───────────────────────────────────────────────────
     feat_dim: int = 8              # number of raw tabular features (set by data)
-    feat_emb_dim: int = 64         # in-context cross-attention output dim
 
     # ── Node representation ────────────────────────────────────────────────
-    node_dim: int = 256            # concat(feat_emb, loc_proj) → 1 linear → node_dim
+    # node_dim input = tabpfn_dim (auto) + loc_proj_dim (above)
+    node_dim: int = 256            # concat(tabpfn_emb, loc_proj) → 1 linear → node_dim
 
     # ── Dynamic kernel matrix (low-rank, p×p) ──────────────────────────────
     # K_i = U_i @ V_i^T,  U_i,V_i ∈ R^{p×rank_k}

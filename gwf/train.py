@@ -82,12 +82,12 @@ def train(cfg: GWFConfig, source: str = "synthetic",
     # ── Model ─────────────────────────────────────────────────────────────
     model = GWF(
         feat_dim     = feat_dim,
-        feat_emb_dim = cfg.feat_emb_dim,
         loc_proj_dim = cfg.loc_proj_dim,
         node_dim     = cfg.node_dim,
         kernel_rank  = cfg.kernel_rank,
         attn_dim     = cfg.attn_dim,
         wls_lambda   = cfg.wls_lambda,
+        tabpfn_path  = cfg.tabpfn_path,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -253,16 +253,21 @@ Examples:
                         help="k-NN neighbours")
     parser.add_argument("--n_samples", type=int,   default=None,
                         help="synthetic dataset size")
+    parser.add_argument("--tabpfn_path", default=None,
+                        metavar="PATH",
+                        help="path to local TabPFN regressor .ckpt; "
+                             "None → attempt HuggingFace download")
     parser.add_argument("--visualise", action="store_true")
     parser.add_argument("--device",    default="cpu")
     args = parser.parse_args()
 
     cfg = GWFConfig()
-    if args.epochs    is not None: cfg.epochs      = args.epochs
-    if args.lr        is not None: cfg.lr          = args.lr
-    if args.batch     is not None: cfg.batch_size  = args.batch
-    if args.k         is not None: cfg.k_neighbors = args.k
-    if args.n_samples is not None: cfg.n_samples   = args.n_samples
+    if args.epochs      is not None: cfg.epochs      = args.epochs
+    if args.lr          is not None: cfg.lr          = args.lr
+    if args.batch       is not None: cfg.batch_size  = args.batch
+    if args.k           is not None: cfg.k_neighbors = args.k
+    if args.n_samples   is not None: cfg.n_samples   = args.n_samples
+    if args.tabpfn_path is not None: cfg.tabpfn_path = args.tabpfn_path
 
     train(cfg,
           source=args.source,
