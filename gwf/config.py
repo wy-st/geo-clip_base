@@ -27,9 +27,10 @@ class GWFConfig:
     # node_dim input = tabpfn_dim (auto) + loc_proj_dim (above)
     node_dim: int = 256            # concat(tabpfn_emb, loc_proj) → 1 linear → node_dim
 
-    # ── Dynamic kernel matrix (low-rank, p×p) ──────────────────────────────
-    # K_i = U_i @ V_i^T,  U_i,V_i ∈ R^{p×rank_k}
-    kernel_rank: int = 4           # low-rank for K_i  (p=feat_dim, rank << p)
+    # ── z-space projection for WLS (GNNWR-style, TabPFN embedding space) ──
+    # K_z = U_i @ V_i^T,  U_i ∈ R^{tabpfn_dim×rank},  V_i ∈ R^{z_proj_dim×rank}
+    z_proj_dim: int = 64           # regression dim in TabPFN embedding space (β dim)
+    kernel_rank: int = 4           # low-rank factor r for K_z = U @ V^T
 
     # ── Attention weights (query-key) ──────────────────────────────────────
     attn_dim: int = 64             # query/key dimension for spatial attention

@@ -1,20 +1,26 @@
 """
-GWF — Dynamic Kernel Matrix Generator
+GWF — Dynamic Kernel Generator (GNNWR-style)
 
-Given the aggregated node representation h_i (from the graph propagation),
+Inspired by GNNWR (Du et al., IJGIS 2020): a neural network learns the
+spatial weight function from contextual node representations, replacing the
+fixed kernel of classical GWR.
+
+Given the aggregated node representation h_i (TabPFN embedding + location),
 this module produces:
 
-  1. K_i ∈ R^{p×p}  — low-rank feature transformation matrix
-       K_i = U_i @ V_i^T,   U_i, V_i ∈ R^{p × rank}
-     Applied as:  X̃ = X @ K_i   (matrix multiply, not scalar multiply)
-     This lets the kernel mix features in a location-aware way.
+  1. K_z ∈ R^{tabpfn_dim × z_proj_dim}  — low-rank adaptive projection
+       K_z = U_i @ V_i^T,   U_i ∈ R^{tabpfn_dim × rank},
+                              V_i ∈ R^{z_proj_dim × rank}
+     Applied as:  Z̃ = z_nbr @ K_z   (project TabPFN hidden features)
+     This projects context-aware TabPFN embeddings into a location-adaptive
+     subspace for the WLS regression.
 
   2. w_ij ∈ R^{k}  — scalar spatial attention weights over neighbours,
-     computed via cross-attention:  q_i (query from h_i) · k_j (key from h_j)
-     Result is softmax-normalised so Σ_j w_ij = 1.
+     computed via cross-attention:  q_i (from h_i) · k_j (from h_j)
+     Softmax-normalised so Σ_j w_ij = 1.
 
-Both outputs are produced by a SINGLE linear layer each (no hidden layers),
-preserving the rich representation learned by the frozen base models.
+Both outputs are produced by a single linear layer each, preserving the
+rich representations from the frozen base models (TabPFN + GeoCLIP).
 """
 
 import torch
@@ -27,22 +33,27 @@ class DynamicKernelGenerator(nn.Module):
     """
     Parameters
     ----------
-    node_dim  : dimension of the aggregated node representation h_i
-    feat_dim  : number of tabular features p (size of K_i matrix)
-    rank      : low-rank factorisation rank r  (r << p)
-    attn_dim  : query/key dimension for spatial attention weights
+    node_dim    : dimension of the aggregated node representation h_i
+    tabpfn_dim  : TabPFN hidden-state dimension (emb_dim from TabPFNInContextEncoder)
+    z_proj_dim  : projection dimension for WLS regression (z_proj_dim << tabpfn_dim)
+    rank        : low-rank factorisation rank r for K_z = U @ V^T
+    attn_dim    : query/key dimension for spatial attention weights
     """
 
-    def __init__(self, node_dim: int, feat_dim: int,
-                 rank: int = 4, attn_dim: int = 64):
+    def __init__(self, node_dim: int, tabpfn_dim: int,
+                 z_proj_dim: int = 64, rank: int = 4, attn_dim: int = 64):
         super().__init__()
-        self.feat_dim = feat_dim
-        self.rank     = rank
-        self.attn_dim = attn_dim
+        self.tabpfn_dim = tabpfn_dim
+        self.z_proj_dim = z_proj_dim
+        self.rank       = rank
+        self.attn_dim   = attn_dim
 
-        # ── Kernel matrix K_i = U_i @ V_i^T ──────────────────────────────
-        # Output size: 2 * p * r  (U and V concatenated)
-        self.kernel_head = nn.Linear(node_dim, 2 * feat_dim * rank, bias=False)
+        # ── K_z: (tabpfn_dim, z_proj_dim) low-rank factorisation ──────────
+        # h_i → (U_i, V_i)  where K_z = U_i @ V_i^T
+        # U_i ∈ R^{tabpfn_dim × rank},  V_i ∈ R^{z_proj_dim × rank}
+        # Output size: (tabpfn_dim + z_proj_dim) * rank
+        self.z_kernel_head = nn.Linear(
+            node_dim, (tabpfn_dim + z_proj_dim) * rank, bias=False)
 
         # ── Spatial attention: query from h_i, key from neighbour h_j ─────
         self.query_head = nn.Linear(node_dim, attn_dim, bias=False)
@@ -51,34 +62,31 @@ class DynamicKernelGenerator(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Small init so K_i starts close to identity-like
-        nn.init.normal_(self.kernel_head.weight, std=0.01)
+        # Small init so K_z starts near zero — the regression begins close to
+        # raw z features before learning location-specific projections.
+        nn.init.normal_(self.z_kernel_head.weight, std=0.01)
         nn.init.xavier_uniform_(self.query_head.weight)
         nn.init.xavier_uniform_(self.key_head.weight)
 
-    # ── K_i generation ───────────────────────────────────────────────────────
+    # ── K_z generation ───────────────────────────────────────────────────────
 
-    def get_kernel_matrix(self, h: torch.Tensor) -> torch.Tensor:
+    def get_z_kernel_matrix(self, h: torch.Tensor) -> torch.Tensor:
         """
-        h : (..., node_dim)
-        Returns K : (..., p, p)  low-rank matrix  K = U @ V^T
+        Generate the location-adaptive z-space projection matrix.
 
-        The identity residual  K_i = I + U_i @ V_i^T  is used so the
-        transformation starts as the identity and only learns deviations.
-        This is crucial for preserving the base-model representations.
+        h   : (B, node_dim)
+        Returns K_z : (B, tabpfn_dim, z_proj_dim)   low-rank  K_z = U @ V^T
+
+        The projection maps TabPFN hidden features from tabpfn_dim → z_proj_dim
+        in a location-aware manner, allowing each query point to select the
+        most relevant dimensions of the in-context embeddings for local regression.
         """
-        p, r = self.feat_dim, self.rank
-        uv = self.kernel_head(h)                        # (..., 2*p*r)
-        U, V = uv[..., :p*r], uv[..., p*r:]
-        U = U.reshape(*h.shape[:-1], p, r)              # (..., p, r)
-        V = V.reshape(*h.shape[:-1], p, r)              # (..., p, r)
-        K = torch.matmul(U, V.transpose(-1, -2))        # (..., p, p)
-
-        # Identity residual: preserve original features by default
-        eye = torch.eye(p, device=h.device, dtype=h.dtype)
-        for _ in range(K.dim() - 2):
-            eye = eye.unsqueeze(0)
-        return eye + K                                   # (..., p, p)
+        d, e, r = self.tabpfn_dim, self.z_proj_dim, self.rank
+        uv = self.z_kernel_head(h)                    # (B, (d+e)*r)
+        U  = uv[:, :d * r].reshape(-1, d, r)          # (B, tabpfn_dim, rank)
+        V  = uv[:, d * r:].reshape(-1, e, r)          # (B, z_proj_dim, rank)
+        K_z = torch.matmul(U, V.transpose(-1, -2))    # (B, tabpfn_dim, z_proj_dim)
+        return K_z
 
     # ── Attention weights w_ij ───────────────────────────────────────────────
 
@@ -88,21 +96,25 @@ class DynamicKernelGenerator(nn.Module):
                               dist:    torch.Tensor | None = None
                               ) -> torch.Tensor:
         """
-        Compute softmax attention weights over neighbours.
+        Compute learned spatial attention weights over neighbours (GNNWR-style).
+
+        Unlike GNNWR's SWNN (which takes a distance vector as input), we use
+        cross-attention between richer node representations that encode both
+        spatial position (via GeoCLIP/SatCLIP) and tabular context (via TabPFN).
 
         h_query : (B, node_dim)
         h_keys  : (B, k, node_dim)
-        dist    : (B, k) optional geographic distances — added as a bias
+        dist    : (B, k) optional geographic distances — added as a soft prior
                   so nearer neighbours still tend to get higher weight
                   (distance-decay inductive bias, learnable to override)
 
-        Returns w : (B, k)  — attention weights, sum to 1
+        Returns w : (B, k)  — spatial weights, sum to 1
         """
         q = self.query_head(h_query)                     # (B, attn_dim)
         k = self.key_head(h_keys)                        # (B, k, attn_dim)
 
         # Scaled dot-product attention
-        scale = math.sqrt(self.attn_dim)
+        scale  = math.sqrt(self.attn_dim)
         scores = torch.einsum("bd,bkd->bk", q, k) / scale  # (B, k)
 
         # Optional distance decay prior

@@ -1,9 +1,9 @@
 """
-GWF — Geographical Weights Foundation Model
+GWF — Geographical Weights Foundation Model (GNNWR-style, TabPFN embedding space)
 
 Full pipeline for one forward pass (B query points, each with k neighbours):
 
-  coords (B,2), x (B,p), y_nbr (B,k)
+  coords (B,2), x (B,p), nbr_x (B,k,p), nbr_y (B,k)
         │
         ├─ LocationFusion (GeoCLIP + SatCLIP, frozen)
         │       └─ e_loc  (B, loc_proj_dim)          ← 1 linear layer
@@ -16,19 +16,26 @@ Full pipeline for one forward pass (B query points, each with k neighbours):
         ├─ Node projection: concat(z, e_loc) → h  (B, node_dim)  ← 1 linear
         │   (shared weights for query and neighbour nodes)
         │
-        ├─ DynamicKernelGenerator
-        │       ├─ K_i (B, p, p)   — feature transformation matrix ← 1 linear
-        │       └─ w_i (B, k)      — spatial attention weights     ← 1 linear q/k
+        ├─ DynamicKernelGenerator  (GNNWR-style learned spatial weighting)
+        │       ├─ K_z (B, tabpfn_dim, z_proj_dim)   — adaptive z-space projection
+        │       │       generated via low-rank U @ V^T from h_query
+        │       └─ w_i  (B, k)                        — spatial attention weights
         │
-        └─ MatrixGWR
-                ├─ X̃ = X_nbr @ K_i
-                ├─ β_i = WLS(X̃, y_nbr, w_i)          ← closed form
-                └─ ŷ_i = (x_i @ K_i) · β_i
+        └─ MatrixGWR  (WLS in the TabPFN embedding space)
+                ├─ Z̃ = z_nbr @ K_z                   (project TabPFN embeddings)
+                ├─ β_i = WLS(Z̃, y_nbr, w_i)          ← closed form, dim=z_proj_dim
+                └─ ŷ_i = (z_query @ K_z) · β_i
+
+Key design insight (from GNNWR):
+  Spatial weights w_i are learned from contextual node representations h_i/h_j
+  (encoding both spatial position and tabular context) rather than a fixed kernel.
+  The WLS regression operates in the TabPFN hidden-feature space (z), which
+  captures the in-context distribution of neighbours and is richer than raw x.
 
 Trainable parameters live ONLY in:
   • LocationFusion.proj          (1 linear)
   • NodeProjection               (1 linear)
-  • DynamicKernelGenerator       (3 linear — kernel, query, key heads)
+  • DynamicKernelGenerator       (3 linear — z_kernel, query, key heads)
 
 Frozen:
   • GeoCLIP encoder              (pretrained)
@@ -56,10 +63,12 @@ class GWF(nn.Module):
 
     Parameters
     ----------
-    feat_dim     : number of raw tabular features  (p)
+    feat_dim     : number of raw tabular features  (p) — used by TabPFN encoder
     loc_proj_dim : output dim of LocationFusion    (after GeoCLIP + SatCLIP fusion)
     node_dim     : node representation dimension   (input to DynamicKernelGenerator)
-    kernel_rank  : low-rank factor r for K_i = I + U @ V^T
+    z_proj_dim   : regression dimension in TabPFN embedding space
+                   (z_proj_dim << tabpfn_dim; determines β dimension)
+    kernel_rank  : low-rank factor r for K_z = U @ V^T
     attn_dim     : query/key dim for spatial attention weights
     wls_lambda   : ridge regularisation in WLS
     tabpfn_path  : path to a local TabPFN regressor .ckpt file;
@@ -71,6 +80,7 @@ class GWF(nn.Module):
         feat_dim:     int   = 8,
         loc_proj_dim: int   = 256,
         node_dim:     int   = 256,
+        z_proj_dim:   int   = 64,
         kernel_rank:  int   = 4,
         attn_dim:     int   = 64,
         wls_lambda:   float = 1e-3,
@@ -78,7 +88,8 @@ class GWF(nn.Module):
     ):
         super().__init__()
 
-        self.feat_dim = feat_dim
+        self.feat_dim   = feat_dim
+        self.z_proj_dim = z_proj_dim
 
         # ── Location encoder (GeoCLIP + SatCLIP, frozen) ──────────────────
         self.loc_enc = LocationFusion(
@@ -93,14 +104,15 @@ class GWF(nn.Module):
         self.node_proj = nn.Linear(tabpfn_dim + loc_proj_dim, node_dim,
                                    bias=True)
 
-        # ── Dynamic kernel matrix and attention weights ────────────────────
+        # ── Dynamic kernel matrix and attention weights (GNNWR-style) ──────
         self.kernel_gen = DynamicKernelGenerator(
             node_dim=node_dim,
-            feat_dim=feat_dim,
+            tabpfn_dim=tabpfn_dim,
+            z_proj_dim=z_proj_dim,
             rank=kernel_rank,
             attn_dim=attn_dim)
 
-        # ── Matrix WLS (no learnable parameters) ──────────────────────────
+        # ── Matrix WLS in TabPFN embedding space (no learnable parameters) ─
         self.gwr = MatrixGWR(lam=wls_lambda)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -129,8 +141,8 @@ class GWF(nn.Module):
 
         Returns
         -------
-        y_hat : (B,)   — predictions
-        beta  : (B, p) — local GWR coefficients (for spatial analysis)
+        y_hat : (B,)            — predictions
+        beta  : (B, z_proj_dim) — local GWR coefficients in projected z-space
         """
         coord     = batch["coord"]       # (B, 2)
         x         = batch["x"]           # (B, p)
@@ -163,13 +175,15 @@ class GWF(nn.Module):
             z_nbr_flat, e_loc_nbr_f
         ).reshape(B, k, -1)                                    # (B, k, node_dim)
 
-        # ── 4. Dynamic kernel matrix K_i and attention weights w_i ────────
-        K = self.kernel_gen.get_kernel_matrix(h_query)              # (B, p, p)
-        w = self.kernel_gen.get_attention_weights(
+        # ── 4. K_z: location-adaptive z-space projection, w: spatial weights
+        # GNNWR-style: both are generated from the learned node representations
+        K_z = self.kernel_gen.get_z_kernel_matrix(h_query)          # (B, tabpfn_dim, z_proj_dim)
+        w   = self.kernel_gen.get_attention_weights(
             h_query, h_nbr, dist=nbr_dist)                          # (B, k)
 
-        # ── 5. Matrix WLS → prediction + local coefficients ───────────────
-        y_hat, beta = self.gwr(x, K, nbr_x, nbr_y, w)              # (B,), (B,p)
+        # ── 5. Matrix WLS in TabPFN embedding space ────────────────────────
+        # Z̃ = z @ K_z  →  β = WLS(Z̃, y, w)  →  ŷ = (z_query @ K_z) · β
+        y_hat, beta = self.gwr(z_query, K_z, z_nbr, nbr_y, w)      # (B,), (B,z_proj_dim)
 
         return y_hat, beta
 
@@ -182,10 +196,10 @@ class GWF(nn.Module):
 
         Returns
         -------
-        y_hat  : (N,)    — all predictions
-        betas  : (N, p)  — local GWR coefficients
-        coords : (N, 2)  — query coordinates
-        y_true : (N,)    — ground-truth targets
+        y_hat  : (N,)            — all predictions
+        betas  : (N, z_proj_dim) — local GWR coefficients in projected z-space
+        coords : (N, 2)          — query coordinates
+        y_true : (N,)            — ground-truth targets
         """
         self.eval()
         all_yhat, all_beta, all_coord, all_y = [], [], [], []
