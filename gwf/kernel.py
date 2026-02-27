@@ -21,24 +21,6 @@ this module produces:
 
 Both outputs are produced by a single linear layer each, preserving the
 rich representations from the frozen base models (TabPFN + GeoCLIP).
-
-Spatial neighbourhood-range uncertainty
-─────────────────────────────────────────
-get_attention_weights accepts an optional eps: (B, k) noise tensor.
-When provided, the attention logits are perturbed before softmax:
-
-  scores_noisy = scores + exp(log_sigma_attn) · ε,   ε ~ N(0, I_k)
-
-log_sigma_attn is a single learnable scalar (global across queries).
-Different ε realisations produce different w → different WLS solutions →
-different ŷ.  The variance of ŷ over ε samples quantifies how sensitive
-the prediction is to uncertainty in *which neighbours are relevant* — i.e.
-the spatial neighbourhood-range uncertainty requested by the boss.
-
-Intuition: in a dense, spatially homogeneous region, all neighbours give
-similar predictions regardless of w, so σ_spatial ≈ 0.  In a transition
-zone (e.g. urban/rural boundary), the choice of neighbourhood boundary
-matters greatly, so σ_spatial is large.
 """
 
 import torch
@@ -77,11 +59,6 @@ class DynamicKernelGenerator(nn.Module):
         self.query_head = nn.Linear(node_dim, attn_dim, bias=False)
         self.key_head   = nn.Linear(node_dim, attn_dim, bias=False)
 
-        # ── Spatial range uncertainty: learnable log-scale for logit noise ─
-        # Initialised to -1 (σ_attn ≈ 0.37) — small enough not to dominate
-        # the learned attention scores at the start of training.
-        self.log_sigma_attn = nn.Parameter(torch.tensor(-1.0))
-
         self._init_weights()
 
     def _init_weights(self):
@@ -116,8 +93,7 @@ class DynamicKernelGenerator(nn.Module):
     def get_attention_weights(self,
                               h_query: torch.Tensor,
                               h_keys:  torch.Tensor,
-                              dist:    torch.Tensor | None = None,
-                              eps:     torch.Tensor | None = None,
+                              dist:    torch.Tensor | None = None
                               ) -> torch.Tensor:
         """
         Compute learned spatial attention weights over neighbours (GNNWR-style).
@@ -131,12 +107,6 @@ class DynamicKernelGenerator(nn.Module):
         dist    : (B, k) optional geographic distances — added as a soft prior
                   so nearer neighbours still tend to get higher weight
                   (distance-decay inductive bias, learnable to override)
-        eps     : (B, k) | None — external noise for spatial-range
-                  reparameterization.  When provided, logits are perturbed:
-                    scores_noisy = scores + exp(log_sigma_attn) · eps
-                  Different eps realisations yield different w → different
-                  WLS solutions, enabling MC estimation of spatial-range
-                  uncertainty in predict_with_uncertainty().
 
         Returns w : (B, k)  — spatial weights, sum to 1
         """
@@ -152,9 +122,5 @@ class DynamicKernelGenerator(nn.Module):
             # Normalise distances to [0,1] and subtract (closer → less penalty)
             d_norm = dist / (dist.max(dim=-1, keepdim=True).values + 1e-8)
             scores = scores - d_norm                        # soft distance bias
-
-        # Spatial-range reparameterization: perturb logits before softmax
-        if eps is not None:
-            scores = scores + self.log_sigma_attn.exp() * eps
 
         return F.softmax(scores, dim=-1)                 # (B, k)
