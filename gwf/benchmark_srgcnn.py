@@ -31,8 +31,9 @@ _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from gwf.data   import build_knn_graph, SpatialRegressionDataset
-from gwf.model  import GWF
+from gwf.data    import build_knn_graph, SpatialRegressionDataset
+from gwf.model   import GWF
+from gwf.model_u import GWF_U
 
 FEATURES = ['accommodates', 'bathrooms', 'bedrooms', 'beds']
 TARGET   = 'log_price'
@@ -66,6 +67,22 @@ def split_622(n, seed=42):
     n_te = int(n * 0.2)
     n_va = int(n * 0.2)
     return idx[n_te + n_va:], idx[n_te:n_te + n_va], idx[:n_te]   # tr, val, te
+
+
+def split_spatial_622(coords):
+    """Geographic band split sorted by latitude (S→N).
+
+    Keeps 6:2:2 ratio but with spatially contiguous train / val / test regions
+    so that test nodes are geographically separated from training nodes.
+    """
+    order  = np.argsort(coords[:, 0])    # sort S→N by latitude
+    n      = len(order)
+    n_te   = int(n * 0.2)
+    n_va   = int(n * 0.2)
+    tr_idx = order[:n - n_te - n_va]     # southernmost 60% → train
+    va_idx = order[n - n_te - n_va: n - n_te]
+    te_idx = order[n - n_te:]            # northernmost 20% → test
+    return tr_idx, va_idx, te_idx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -286,6 +303,111 @@ def run_gwf(coords, X, y_norm, y_raw, y_mean, y_std,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GWF-U  (BNN reparameterization)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_gwf_u(coords, X, y_norm, y_raw, y_mean, y_std,
+              tr, va, te, epochs, lr, k, batch_size, seed, device,
+              n_mc=20):
+
+    torch.manual_seed(seed)
+    nbr_idx, nbr_dist = build_knn_graph(coords, k)
+    dataset = SpatialRegressionDataset(coords, X, y_norm, nbr_idx, nbr_dist)
+
+    train_dl = DataLoader(Subset(dataset, tr), batch_size=batch_size,
+                          shuffle=True, drop_last=True, num_workers=0)
+    val_dl   = DataLoader(Subset(dataset, va), batch_size=batch_size,
+                          shuffle=False, num_workers=0)
+    test_dl  = DataLoader(Subset(dataset, te), batch_size=batch_size,
+                          shuffle=False, num_workers=0)
+
+    model = GWF_U(feat_dim=X.shape[1]).to(device)
+    opt   = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.05)
+    e_dim = model.z_proj_dim
+
+    best_val   = float("inf")
+    best_state = None
+
+    print(f"\n{'Epoch':>6}  {'TrainRMSE':>10}  {'ValRMSE':>8}  {'logσ':>7}  {'Time':>6}")
+    print("─" * 48)
+
+    for ep in range(1, epochs + 1):
+        t0 = time.time()
+        model.train()
+        tr_losses = []
+        for batch in train_dl:
+            batch = {kk: vv.to(device) for kk, vv in batch.items()
+                     if isinstance(vv, torch.Tensor)}
+            B   = batch["coord"].shape[0]
+            eps = torch.randn(B, e_dim, device=device)
+            yh, _ = model(batch, eps_beta=eps)
+            loss  = model.loss(yh, batch["y"])
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_losses.append(loss.item())
+        sched.step()
+
+        model.eval()
+        val_preds, val_true = [], []
+        with torch.no_grad():
+            for batch in val_dl:
+                batch = {kk: vv.to(device) for kk, vv in batch.items()
+                         if isinstance(vv, torch.Tensor)}
+                yh, _ = model(batch)          # MAP estimate for val
+                val_preds.append(yh.cpu()); val_true.append(batch["y"].cpu())
+        val_rmse = math.sqrt(np.mean((torch.cat(val_preds).numpy() -
+                                      torch.cat(val_true).numpy()) ** 2))
+
+        if val_rmse < best_val:
+            best_val   = val_rmse
+            best_state = {kk: vv.clone() for kk, vv in model.state_dict().items()}
+
+        if ep % max(1, epochs // 10) == 0 or ep == 1:
+            tr_rmse = math.sqrt(np.mean(tr_losses))
+            log_s   = model.gwr.log_sigma.item()
+            print(f"{ep:>6}  {tr_rmse:>10.4f}  {val_rmse:>8.4f}  "
+                  f"{log_s:>7.3f}  {time.time()-t0:>5.1f}s")
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    # MAP point predictions + MC uncertainty (n_mc samples)
+    te_preds_map, te_sigma, te_true = [], [], []
+    with torch.no_grad():
+        for batch in test_dl:
+            batch = {kk: vv.to(device) for kk, vv in batch.items()
+                     if isinstance(vv, torch.Tensor)}
+            B = batch["coord"].shape[0]
+
+            yh_map, _ = model(batch)          # MAP
+            mc_preds  = []
+            for _ in range(n_mc):
+                eps  = torch.randn(B, e_dim, device=device)
+                yh_i, _ = model(batch, eps_beta=eps)
+                mc_preds.append(yh_i)
+            sigma = torch.stack(mc_preds).std(dim=0)
+
+            te_preds_map.append(yh_map.cpu())
+            te_sigma.append(sigma.cpu())
+            te_true.append(batch["y"].cpu())
+
+    pred_norm = torch.cat(te_preds_map).numpy()
+    true_norm = torch.cat(te_true).numpy()
+    sigma_norm = torch.cat(te_sigma).numpy()
+
+    pred_raw  = pred_norm  * y_std + y_mean
+    true_raw  = true_norm  * y_std + y_mean
+    sigma_raw = sigma_norm * y_std            # scale σ back to original units
+
+    rmse, r2, mape = metrics(pred_raw, true_raw)
+    mean_sigma = float(sigma_raw.mean())
+    return rmse, r2, mape, mean_sigma
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -297,19 +419,19 @@ def main():
     ap.add_argument("--gwf_epochs",    type=int,   default=50)
     ap.add_argument("--gwf_lr",        type=float, default=3e-4)
     ap.add_argument("--gwf_batch",     type=int,   default=256)
-    ap.add_argument("--srgcnn_epochs", type=int,   default=3000)
+    ap.add_argument("--srgcnn_epochs", type=int,   default=20)
     ap.add_argument("--srgcnn_lr",     type=float, default=3e-2)
     ap.add_argument("--device",        default="cpu")
     args = ap.parse_args()
 
     print("=" * 62)
     print("  GWF vs SRGCNN-GW vs OLS — San Diego Airbnb  (log_price)")
-    print(f"  Split: 60% train / 20% val / 20% test  (seed={args.seed})")
+    print("  Split: 60% train / 20% val / 20% test  (spatial, lat-sorted)")
     print("=" * 62)
 
     coords, X, y_norm, y_raw, y_mean, y_std = load_airbnb(args.data)
     n = len(X)
-    tr, va, te = split_622(n, args.seed)
+    tr, va, te = split_spatial_622(coords)
     print(f"  n={n}  train={len(tr)}  val={len(va)}  test={len(te)}  p={X.shape[1]}")
 
     results = {}
@@ -321,7 +443,7 @@ def main():
     print(f"  RMSE={rmse:.4f}  R²={r2:.4f}  MAPE={mape:.2f}%")
 
     # ── SRGCNN-GW ─────────────────────────────────────────────────────────
-    print(f"\n── SRGCNN-GW  ({args.srgcnn_epochs} epochs, lr={args.srgcnn_lr}) ──")
+    print(f"\n── SRGCNN-GW  ({args.srgcnn_epochs} epochs, lr={args.srgcnn_lr}) ─────────")
     results["SRGCNN-GW"] = run_srgcnn_gw(
         X, y_raw, y_mean, y_std, coords, tr, va, te,
         epochs=args.srgcnn_epochs, lr=args.srgcnn_lr,
@@ -340,6 +462,19 @@ def main():
     rmse, r2, mape = results["GWF"]
     print(f"\n  Test → RMSE={rmse:.4f}  R²={r2:.4f}  MAPE={mape:.2f}%")
 
+    # ── GWF-U (BNN) ───────────────────────────────────────────────────────
+    print(f"\n── GWF-U  ({args.gwf_epochs} epochs, lr={args.gwf_lr}, n_mc=20) ─")
+    gwfu_res = run_gwf_u(
+        coords, X, y_norm, y_raw, y_mean, y_std,
+        tr, va, te,
+        epochs=args.gwf_epochs, lr=args.gwf_lr,
+        k=args.k, batch_size=args.gwf_batch,
+        seed=args.seed, device=args.device, n_mc=20)
+    results["GWF-U"] = gwfu_res[:3]          # (rmse, r2, mape) for table
+    rmse, r2, mape, mean_sigma = gwfu_res
+    print(f"\n  Test → RMSE={rmse:.4f}  R²={r2:.4f}  MAPE={mape:.2f}%"
+          f"  mean_σ={mean_sigma:.4f}")
+
     # ── Summary ───────────────────────────────────────────────────────────
     print("\n" + "=" * 62)
     print("  FINAL RESULTS — 20% held-out test set")
@@ -348,6 +483,7 @@ def main():
     print(f"  {'-'*46}")
     for name, (rmse, r2, mape) in results.items():
         print(f"  {name:<18} {rmse:>8.4f} {r2:>8.4f} {mape:>7.2f}%")
+    print(f"\n  GWF-U mean predictive σ (log_price scale): {gwfu_res[3]:.4f}")
     print("=" * 62)
 
 
