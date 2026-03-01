@@ -56,7 +56,6 @@ def _load_tabpfn_transformer(model_path: str | None = None):
         Hidden dimension of the transformer (= model.ninp).
     """
     try:
-        from tabpfn import TabPFNRegressor
         from tabpfn.model_loading import load_model_criterion_config
     except ImportError as e:
         raise ImportError(
@@ -64,13 +63,15 @@ def _load_tabpfn_transformer(model_path: str | None = None):
             "Install it with: pip install tabpfn"
         ) from e
 
-    # load_model_criterion_config returns (model, criterion, config)
-    model, _, _ = load_model_criterion_config(
+    # TabPFN ≥ 2.0 API: returns (list[model], criterion, list[config], inf_config)
+    models, _, _, _ = load_model_criterion_config(
         model_path=model_path,
-        task_type="regression",
-        inference_config=None,
-        fit_mode="low_memory",
+        check_bar_distribution_criterion=False,
+        cache_trainset_representation=False,
+        which="regressor",
+        download_if_not_exists=(model_path is None),
     )
+    model = models[0]   # use the first model in the ensemble
 
     for p in model.parameters():
         p.requires_grad_(False)
@@ -165,9 +166,10 @@ class TabPFNInContextEncoder(nn.Module):
                 only_return_standard_out=False,
             )
 
-        # out["test_embeddings"]  : (B, n_test, ninp)  — n_test == 1
-        # out["train_embeddings"] : (B, k,      ninp)
-        z_query = out["test_embeddings"].squeeze(1)   # (B, ninp)
-        z_nbr   = out["train_embeddings"]             # (B, k, ninp)
+        # TabPFN v2 layout  (seq_len, B, ninp) — note: batch dim is second
+        # out["test_embeddings"]  : (n_test, B, ninp)  — n_test == 1
+        # out["train_embeddings"] : (k,      B, ninp)
+        z_query = out["test_embeddings"][0]           # (B, ninp)
+        z_nbr   = out["train_embeddings"].permute(1, 0, 2)  # (B, k, ninp)
 
         return z_query, z_nbr
