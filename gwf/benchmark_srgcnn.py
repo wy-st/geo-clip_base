@@ -1,42 +1,31 @@
 """
-GWF vs SRGCNN Benchmark — San Diego Airbnb (log_price)
+GWF vs SRGCNN-GW vs OLS — San Diego Airbnb  (log_price)
+Unified 6:2:2 random train/val/test split, same seed for all models.
 
-Dataset  : SRGCNN repo  airbnb/regression_db.geojson
-           n=6110, features: accommodates, bathrooms, bedrooms, beds
-           target: log_price
-
-SRGCNN-GW reference results (full-data self-eval, no train/test split):
-   MAPE = 4.81%,  R² = 0.789
-
-This script evaluates GWF with an 80/20 inductive train/test split,
-which is a harder but more meaningful evaluation protocol.
-
-Baselines included:
-  OLS  — ordinary least squares (sklearn)
-  GWF  — our model (this work)
+Dataset : airbnb/regression_db.geojson  (n=6110)
+Features: accommodates, bathrooms, bedrooms, beds  (p=4)
+Target  : log_price
 
 Usage
 -----
-    python -m gwf.benchmark_srgcnn                       # default settings
-    python -m gwf.benchmark_srgcnn --epochs 100 --k 20  # custom
+    python -m gwf.benchmark_srgcnn
+    python -m gwf.benchmark_srgcnn --gwf_epochs 100 --srgcnn_epochs 5000
     python -m gwf.benchmark_srgcnn --data path/to/regression_db.geojson
 """
 
-import argparse
-import json
-import math
-import os
-import sys
-import time
-
+import argparse, json, math, os, sys, time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from scipy.sparse import csr_matrix, diags, eye as speye
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
-from torch.optim import AdamW
+from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, Subset
 
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
@@ -44,183 +33,256 @@ if _root not in sys.path:
 
 from gwf.data   import build_knn_graph, SpatialRegressionDataset
 from gwf.model  import GWF
-from gwf.config import GWFConfig
-from torch.utils.data import DataLoader, random_split
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data loading
-# ─────────────────────────────────────────────────────────────────────────────
 
 FEATURES = ['accommodates', 'bathrooms', 'bedrooms', 'beds']
-TARGET    = 'log_price'
+TARGET   = 'log_price'
 
 
-def load_airbnb(path: str):
-    """
-    Parse SRGCNN airbnb GeoJSON → (coords, X, y, y_mean, y_std).
-    coords : (n, 2) float32  [lat, lon]
-    X      : (n, 4) float32  standardised features
-    y      : (n,)   float32  standardised log_price  (for training)
-    y_mean, y_std : scalars for de-standardising predictions
-    """
+# ─────────────────────────────────────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_airbnb(path):
     with open(path) as f:
         gj = json.load(f)
-
     rows = []
     for feat in gj['features']:
         p = feat['properties']
         lon, lat = feat['geometry']['coordinates']
-        row = [lat, lon] + [float(p[k]) for k in FEATURES] + [float(p[TARGET])]
-        rows.append(row)
+        rows.append([lat, lon] + [float(p[k]) for k in FEATURES] + [float(p[TARGET])])
+    arr    = np.array(rows, dtype=np.float64)
+    coords = arr[:, :2].astype(np.float32)
+    scaler = StandardScaler()
+    X      = scaler.fit_transform(arr[:, 2:6]).astype(np.float32)
+    y_raw  = arr[:, 6].astype(np.float32)
+    y_mean, y_std = float(y_raw.mean()), float(y_raw.std())
+    y_norm = ((y_raw - y_mean) / y_std).astype(np.float32)
+    return coords, X, y_norm, y_raw, y_mean, y_std
 
-    arr      = np.array(rows, dtype=np.float64)
-    coords   = arr[:, :2].astype(np.float32)
 
-    scaler_x = StandardScaler()
-    X        = scaler_x.fit_transform(arr[:, 2:6]).astype(np.float32)
-
-    y_raw    = arr[:, 6].astype(np.float32)
-    y_mean   = float(y_raw.mean())
-    y_std    = float(y_raw.std())
-    y        = ((y_raw - y_mean) / y_std).astype(np.float32)
-
-    return coords, X, y, y_mean, y_std, y_raw
+def split_622(n, seed=42):
+    rng  = np.random.default_rng(seed)
+    idx  = rng.permutation(n)
+    n_te = int(n * 0.2)
+    n_va = int(n * 0.2)
+    return idx[n_te + n_va:], idx[n_te:n_te + n_va], idx[:n_te]   # tr, val, te
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
-def rmse(pred, true):
-    return math.sqrt(((pred - true) ** 2).mean())
-
-
-def mape(pred, true):
-    """MAPE on original (log_price) scale, matching SRGCNN notebook."""
-    return float(np.mean(np.abs((pred - true) / (np.abs(true) + 1e-8)))) * 100
-
-
-def r2(pred, true):
-    return float(r2_score(true, pred))
+def metrics(pred, true):
+    rmse = math.sqrt(((pred - true) ** 2).mean())
+    r2   = float(r2_score(true, pred))
+    mape = float(np.mean(np.abs((pred - true) / (np.abs(true) + 1e-8)))) * 100
+    return rmse, r2, mape
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OLS baseline
+# OLS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_ols(X_train, y_train, X_test, y_test_raw, y_mean, y_std):
-    reg = LinearRegression().fit(X_train, y_train)
-    y_pred_std = reg.predict(X_test).astype(np.float32)
-    y_pred_raw = y_pred_std * y_std + y_mean
-    return {
-        "RMSE":  rmse(y_pred_raw, y_test_raw),
-        "R²":    r2(y_pred_raw, y_test_raw),
-        "MAPE":  mape(y_pred_raw, y_test_raw),
-    }
+def run_ols(X, y_norm, y_raw, y_mean, y_std, tr, te):
+    reg = LinearRegression().fit(X[tr], y_norm[tr])
+    pred_raw = reg.predict(X[te]).astype(np.float32) * y_std + y_mean
+    return metrics(pred_raw, y_raw[te])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GWF training & evaluation
+# SRGCNN-GW  (reproduced from dizhu-gis/SRGCNN notebook)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_gwf(coords, X, y, y_raw, y_mean, y_std,
-            k, epochs, lr, batch_size, val_split, seed, device):
+def _build_adj(coords, k=20):
+    """Symmetric k-NN Laplacian normalised adjacency (renorm trick)."""
+    nn_obj = NearestNeighbors(n_neighbors=k + 1, algorithm='ball_tree').fit(coords)
+    _, idx = nn_obj.kneighbors(coords)
+    n = len(coords)
+    rows = np.repeat(np.arange(n), k)
+    cols = idx[:, 1:].ravel()
+    data = np.ones(len(rows))
+    A    = csr_matrix((data, (rows, cols)), shape=(n, n)).toarray()
+    A    = np.logical_or(A, A.T).astype(float)   # symmetrise
+    A    = A + np.eye(n)                          # add self-loops (renorm trick)
+    deg  = A.sum(1)
+    d_inv_sqrt = np.diag(1.0 / np.sqrt(deg))
+    return d_inv_sqrt @ A @ d_inv_sqrt            # D^{-1/2} A~ D^{-1/2}
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
 
-    nbr_idx, nbr_dist = build_knn_graph(coords, k)
-    dataset = SpatialRegressionDataset(coords, X, y, nbr_idx, nbr_dist)
+class GWGraphConvolution(nn.Module):
+    def __init__(self, n_nodes, f_in, f_out, activation=nn.ReLU()):
+        super().__init__()
+        self.activation  = activation
+        self.gwr_weight  = nn.Parameter(torch.ones(n_nodes, f_in))
+        self.weight      = nn.Parameter(torch.ones(f_in, f_out))
+        self.bias        = nn.Parameter(torch.zeros(f_out))
 
-    n_val   = int(len(dataset) * val_split)
-    n_train = len(dataset) - n_val
-    train_ds, val_ds = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(seed))
+    def forward(self, x, adj):
+        out = torch.mm(adj, torch.mul(x, self.gwr_weight))
+        out = torch.mm(out, self.weight) + self.bias
+        if self.activation is not None:
+            out = self.activation(out)
+        return out
 
-    train_dl = DataLoader(train_ds, batch_size=batch_size,
-                          shuffle=True,  drop_last=True,  num_workers=0)
-    val_dl   = DataLoader(val_ds,   batch_size=batch_size,
-                          shuffle=False, drop_last=False, num_workers=0)
 
-    model = GWF(feat_dim=X.shape[1]).to(device)
-    opt   = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    sched = CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.05)
-    loss_fn = nn.MSELoss()
+class GWGCN(nn.Module):
+    def __init__(self, n_nodes, f_in, f_out, hidden, dropout=0.5):
+        super().__init__()
+        self.dropout = dropout
+        dims = [f_in] + hidden
+        self.layers = nn.ModuleList([
+            GWGraphConvolution(n_nodes, dims[i], dims[i+1])
+            for i in range(len(hidden))
+        ])
+        self.out_layer = GWGraphConvolution(n_nodes, dims[-1], f_out,
+                                            activation=None)
 
-    best_rmse  = float("inf")
+    def forward(self, x, adj):
+        for layer in self.layers:
+            x = layer(x, adj)
+            x = F.dropout(x, self.dropout, training=self.training)
+        return self.out_layer(x, adj)
+
+
+def run_srgcnn_gw(X, y_raw, y_mean, y_std, coords, tr, va, te,
+                  epochs, lr, k, device):
+    n = len(X)
+    print(f"\n  Building {n}×{n} adjacency (k={k})…", end=" ", flush=True)
+    adj_np = _build_adj(coords, k=k)
+    print("done")
+
+    adj  = torch.FloatTensor(adj_np).to(device)
+    y_norm = ((y_raw - y_mean) / y_std).astype(np.float32)
+
+    x_t = torch.FloatTensor(X).to(device)
+    y_t = torch.FloatTensor(y_norm).unsqueeze(1).to(device)
+
+    tr_idx = torch.LongTensor(tr).to(device)
+    va_idx = torch.LongTensor(va).to(device)
+    te_idx = torch.LongTensor(te).to(device)
+
+    f_in   = X.shape[1]
+    hidden = [8 * f_in]   # = [32] matching notebook default
+
+    model = GWGCN(n, f_in, 1, hidden, dropout=0.5).to(device)
+    opt   = Adam(model.parameters(), lr=lr)
+
+    best_val = float("inf")
     best_state = None
 
-    print(f"\n{'Epoch':>6}  {'Train-RMSE':>11}  {'Val-RMSE':>9}  {'Time':>6}")
-    print("─" * 42)
+    print(f"\n{'Epoch':>7}  {'TrainMSE':>9}  {'ValMSE':>8}  {'Time':>6}")
+    print("─" * 38)
 
-    for epoch in range(1, epochs + 1):
+    for ep in range(1, epochs + 1):
         t0 = time.time()
-
         model.train()
-        train_losses = []
+        opt.zero_grad()
+        out  = model(x_t, adj)
+        loss = F.mse_loss(out[tr_idx], y_t[tr_idx])
+        loss.backward()
+        opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            out_val = model(x_t, adj)
+            val_mse = F.mse_loss(out_val[va_idx], y_t[va_idx]).item()
+
+        if val_mse < best_val:
+            best_val   = val_mse
+            best_state = {k2: v.clone() for k2, v in model.state_dict().items()}
+
+        if ep % max(1, epochs // 10) == 0 or ep == 1:
+            print(f"{ep:>7}  {loss.item():>9.4f}  {val_mse:>8.4f}  "
+                  f"{time.time()-t0:>5.1f}s")
+
+    model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        out_te  = model(x_t, adj)[te_idx].cpu().numpy().ravel()
+    pred_raw = out_te * y_std + y_mean
+    return metrics(pred_raw, y_raw[te])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GWF
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_gwf(coords, X, y_norm, y_raw, y_mean, y_std,
+            tr, va, te, epochs, lr, k, batch_size, seed, device):
+
+    torch.manual_seed(seed)
+    nbr_idx, nbr_dist = build_knn_graph(coords, k)
+    dataset = SpatialRegressionDataset(coords, X, y_norm, nbr_idx, nbr_dist)
+
+    train_dl = DataLoader(Subset(dataset, tr), batch_size=batch_size,
+                          shuffle=True, drop_last=True, num_workers=0)
+    val_dl   = DataLoader(Subset(dataset, va), batch_size=batch_size,
+                          shuffle=False, num_workers=0)
+    test_dl  = DataLoader(Subset(dataset, te), batch_size=batch_size,
+                          shuffle=False, num_workers=0)
+
+    model   = GWF(feat_dim=X.shape[1]).to(device)
+    opt     = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched   = CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.05)
+    loss_fn = nn.MSELoss()
+
+    best_val  = float("inf")
+    best_state = None
+
+    print(f"\n{'Epoch':>6}  {'TrainRMSE':>10}  {'ValRMSE':>8}  {'Time':>6}")
+    print("─" * 40)
+
+    for ep in range(1, epochs + 1):
+        t0 = time.time()
+        model.train()
+        tr_losses = []
         for batch in train_dl:
-            batch = {k2: v.to(device) for k2, v in batch.items()
-                     if isinstance(v, torch.Tensor)}
-            y_hat, _ = model(batch)
-            loss = loss_fn(y_hat, batch["y"])
+            batch = {kk: vv.to(device) for kk, vv in batch.items()
+                     if isinstance(vv, torch.Tensor)}
+            yh, _ = model(batch)
+            loss  = loss_fn(yh, batch["y"])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            train_losses.append(loss.item())
+            tr_losses.append(loss.item())
         sched.step()
 
         model.eval()
         val_preds, val_true = [], []
         with torch.no_grad():
             for batch in val_dl:
-                batch = {k2: v.to(device) for k2, v in batch.items()
-                         if isinstance(v, torch.Tensor)}
+                batch = {kk: vv.to(device) for kk, vv in batch.items()
+                         if isinstance(vv, torch.Tensor)}
                 yh, _ = model(batch)
-                val_preds.append(yh.cpu())
-                val_true.append(batch["y"].cpu())
+                val_preds.append(yh.cpu()); val_true.append(batch["y"].cpu())
+        val_rmse = math.sqrt(np.mean((torch.cat(val_preds).numpy() -
+                                      torch.cat(val_true).numpy()) ** 2))
 
-        val_preds = torch.cat(val_preds).numpy()
-        val_true  = torch.cat(val_true).numpy()
+        if val_rmse < best_val:
+            best_val   = val_rmse
+            best_state = {kk: vv.clone() for kk, vv in model.state_dict().items()}
 
-        tr_rmse = math.sqrt(np.mean(train_losses))
-        vl_rmse = rmse(val_preds, val_true)
-        elapsed = time.time() - t0
-
-        if epoch % 20 == 0 or epoch == 1:
-            print(f"{epoch:>6}  {tr_rmse:>11.4f}  {vl_rmse:>9.4f}  {elapsed:>5.1f}s")
-
-        if vl_rmse < best_rmse:
-            best_rmse  = vl_rmse
-            best_state = {k2: v.clone() for k2, v in model.state_dict().items()}
+        if ep % max(1, epochs // 10) == 0 or ep == 1:
+            tr_rmse = math.sqrt(np.mean(tr_losses))
+            print(f"{ep:>6}  {tr_rmse:>10.4f}  {val_rmse:>8.4f}  "
+                  f"{time.time()-t0:>5.1f}s")
 
     model.load_state_dict(best_state)
-
-    # ── Final evaluation on val set in original log_price scale ───────────
     model.eval()
-    preds_std, true_std = [], []
+    te_preds, te_true = [], []
     with torch.no_grad():
-        for batch in val_dl:
-            batch = {k2: v.to(device) for k2, v in batch.items()
-                     if isinstance(v, torch.Tensor)}
+        for batch in test_dl:
+            batch = {kk: vv.to(device) for kk, vv in batch.items()
+                     if isinstance(vv, torch.Tensor)}
             yh, _ = model(batch)
-            preds_std.append(yh.cpu().numpy())
-            true_std.append(batch["y"].cpu().numpy())
+            te_preds.append(yh.cpu()); te_true.append(batch["y"].cpu())
 
-    preds_std = np.concatenate(preds_std)
-    true_std  = np.concatenate(true_std)
-
-    # De-standardise
-    preds_raw = preds_std * y_std + y_mean
-    true_raw  = true_std  * y_std + y_mean
-
-    return {
-        "RMSE": rmse(preds_raw, true_raw),
-        "R²":   r2(preds_raw, true_raw),
-        "MAPE": mape(preds_raw, true_raw),
-    }, model
+    pred_norm = torch.cat(te_preds).numpy()
+    true_norm = torch.cat(te_true).numpy()
+    pred_raw  = pred_norm * y_std + y_mean
+    true_raw  = true_norm * y_std + y_mean
+    return metrics(pred_raw, true_raw)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,71 +290,65 @@ def run_gwf(coords, X, y, y_raw, y_mean, y_std,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser("GWF vs SRGCNN benchmark")
-    parser.add_argument("--data",       default="airbnb_regression_db.geojson",
-                        help="path to SRGCNN regression_db.geojson")
-    parser.add_argument("--epochs",     type=int,   default=150)
-    parser.add_argument("--k",          type=int,   default=20,
-                        help="k-NN neighbours (SRGCNN uses k=20)")
-    parser.add_argument("--lr",         type=float, default=3e-4)
-    parser.add_argument("--batch",      type=int,   default=256)
-    parser.add_argument("--val_split",  type=float, default=0.2)
-    parser.add_argument("--seed",       type=int,   default=42)
-    parser.add_argument("--device",     default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data",          default="airbnb_regression_db.geojson")
+    ap.add_argument("--k",             type=int,   default=20)
+    ap.add_argument("--seed",          type=int,   default=42)
+    ap.add_argument("--gwf_epochs",    type=int,   default=50)
+    ap.add_argument("--gwf_lr",        type=float, default=3e-4)
+    ap.add_argument("--gwf_batch",     type=int,   default=256)
+    ap.add_argument("--srgcnn_epochs", type=int,   default=3000)
+    ap.add_argument("--srgcnn_lr",     type=float, default=3e-2)
+    ap.add_argument("--device",        default="cpu")
+    args = ap.parse_args()
 
-    print("=" * 60)
-    print("  GWF vs SRGCNN — San Diego Airbnb (log_price)")
-    print("=" * 60)
-    print(f"  data={args.data}  k={args.k}  epochs={args.epochs}")
-    print(f"  device={args.device}  val_split={args.val_split}")
+    print("=" * 62)
+    print("  GWF vs SRGCNN-GW vs OLS — San Diego Airbnb  (log_price)")
+    print(f"  Split: 60% train / 20% val / 20% test  (seed={args.seed})")
+    print("=" * 62)
 
-    # ── Load data ─────────────────────────────────────────────────────────
-    coords, X, y, y_mean, y_std, y_raw = load_airbnb(args.data)
-    n, p = X.shape
-    print(f"\n  n={n}, p={p}, y_mean={y_mean:.3f}, y_std={y_std:.3f}")
+    coords, X, y_norm, y_raw, y_mean, y_std = load_airbnb(args.data)
+    n = len(X)
+    tr, va, te = split_622(n, args.seed)
+    print(f"  n={n}  train={len(tr)}  val={len(va)}  test={len(te)}  p={X.shape[1]}")
 
-    # ── Train/test split indices for OLS ──────────────────────────────────
-    rng     = np.random.default_rng(args.seed)
-    n_val   = int(n * args.val_split)
-    idx     = rng.permutation(n)
-    tr_idx  = idx[n_val:]
-    val_idx = idx[:n_val]
+    results = {}
 
-    # ── OLS baseline ──────────────────────────────────────────────────────
-    print("\n── OLS baseline ──────────────────────────────────────────────")
-    ols_metrics = run_ols(
-        X[tr_idx], y[tr_idx],
-        X[val_idx], y_raw[val_idx],
-        y_mean, y_std)
-    print(f"  RMSE={ols_metrics['RMSE']:.4f}  R²={ols_metrics['R²']:.4f}  "
-          f"MAPE={ols_metrics['MAPE']:.2f}%")
+    # ── OLS ───────────────────────────────────────────────────────────────
+    print("\n── OLS ───────────────────────────────────────────────────────")
+    results["OLS"] = run_ols(X, y_norm, y_raw, y_mean, y_std, tr, te)
+    rmse, r2, mape = results["OLS"]
+    print(f"  RMSE={rmse:.4f}  R²={r2:.4f}  MAPE={mape:.2f}%")
+
+    # ── SRGCNN-GW ─────────────────────────────────────────────────────────
+    print(f"\n── SRGCNN-GW  ({args.srgcnn_epochs} epochs, lr={args.srgcnn_lr}) ──")
+    results["SRGCNN-GW"] = run_srgcnn_gw(
+        X, y_raw, y_mean, y_std, coords, tr, va, te,
+        epochs=args.srgcnn_epochs, lr=args.srgcnn_lr,
+        k=args.k, device=args.device)
+    rmse, r2, mape = results["SRGCNN-GW"]
+    print(f"\n  Test → RMSE={rmse:.4f}  R²={r2:.4f}  MAPE={mape:.2f}%")
 
     # ── GWF ───────────────────────────────────────────────────────────────
-    print("\n── GWF ───────────────────────────────────────────────────────")
-    gwf_metrics, _ = run_gwf(
-        coords, X, y, y_raw, y_mean, y_std,
-        k=args.k, epochs=args.epochs, lr=args.lr,
-        batch_size=args.batch, val_split=args.val_split,
+    print(f"\n── GWF  ({args.gwf_epochs} epochs, lr={args.gwf_lr}) ────────────")
+    results["GWF"] = run_gwf(
+        coords, X, y_norm, y_raw, y_mean, y_std,
+        tr, va, te,
+        epochs=args.gwf_epochs, lr=args.gwf_lr,
+        k=args.k, batch_size=args.gwf_batch,
         seed=args.seed, device=args.device)
+    rmse, r2, mape = results["GWF"]
+    print(f"\n  Test → RMSE={rmse:.4f}  R²={r2:.4f}  MAPE={mape:.2f}%")
 
     # ── Summary ───────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  RESULTS SUMMARY  (80/20 inductive train/test split)")
-    print("=" * 60)
-    print(f"  {'Model':<20} {'RMSE':>8} {'R²':>8} {'MAPE':>8}")
+    print("\n" + "=" * 62)
+    print("  FINAL RESULTS — 20% held-out test set")
+    print("=" * 62)
+    print(f"  {'Model':<18} {'RMSE':>8} {'R²':>8} {'MAPE':>8}")
     print(f"  {'-'*46}")
-    print(f"  {'OLS':<20} {ols_metrics['RMSE']:>8.4f} "
-          f"{ols_metrics['R²']:>8.4f} {ols_metrics['MAPE']:>7.2f}%")
-    print(f"  {'GWF (ours)':<20} {gwf_metrics['RMSE']:>8.4f} "
-          f"{gwf_metrics['R²']:>8.4f} {gwf_metrics['MAPE']:>7.2f}%")
-    print()
-    print("  SRGCNN-GW reference (full-data self-eval, no split):")
-    print(f"  {'SRGCNN-GW':<20} {'N/A':>8} {'0.7888':>8} {'4.81':>7}%")
-    print()
-    print("  Note: SRGCNN-GW trains and evaluates on the full dataset")
-    print("  (transductive). GWF uses a stricter inductive 80/20 split.")
-    print("=" * 60)
+    for name, (rmse, r2, mape) in results.items():
+        print(f"  {name:<18} {rmse:>8.4f} {r2:>8.4f} {mape:>7.2f}%")
+    print("=" * 62)
 
 
 if __name__ == "__main__":
