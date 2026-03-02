@@ -77,14 +77,15 @@ class GWF(nn.Module):
 
     def __init__(
         self,
-        feat_dim:     int   = 8,
-        loc_proj_dim: int   = 256,
-        node_dim:     int   = 256,
-        z_proj_dim:   int   = 64,
-        kernel_rank:  int   = 4,
-        attn_dim:     int   = 64,
-        wls_lambda:   float = 1e-3,
-        tabpfn_path:  str | None = None,
+        feat_dim:      int        = 8,
+        loc_proj_dim:  int        = 256,
+        node_dim:      int        = 256,
+        z_proj_dim:    int        = 64,
+        kernel_rank:   int        = 4,
+        attn_dim:      int        = 64,
+        wls_lambda:    float      = 1e-3,
+        tabpfn_path:   str | None = None,
+        satclip_ckpt:  str | None = None,
     ):
         super().__init__()
 
@@ -93,7 +94,8 @@ class GWF(nn.Module):
 
         # ── Location encoder (GeoCLIP + SatCLIP, frozen) ──────────────────
         self.loc_enc = LocationFusion(
-            geo_dim=512, sat_dim=512, out_dim=loc_proj_dim)
+            geo_dim=512, sat_dim=512, out_dim=loc_proj_dim,
+            satclip_ckpt=satclip_ckpt)
 
         # ── TabPFN in-context encoder (pretrained, frozen) ─────────────────
         self.ctx_enc = TabPFNInContextEncoder(model_path=tabpfn_path)

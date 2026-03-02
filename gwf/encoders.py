@@ -88,31 +88,69 @@ class _SatCLIPProxy(nn.Module):
 
 class SatCLIPEncoder(nn.Module):
     """
-    SatCLIP location encoder.
-    Tries to load the official `satclip` package first;
-    falls back to _SatCLIPProxy if not available.
+    SatCLIP location encoder — three loading strategies, tried in order:
+
+    1. **Local checkpoint** (preferred): pass ``ckpt_path`` to load the
+       official pretrained weights without any network access.
+       Checkpoint files can be downloaded from HuggingFace::
+
+           # e.g. microsoft/SatCLIP-ResNet50-L10  (lightest, ~50 MB)
+           huggingface-cli download microsoft/SatCLIP-ResNet50-L10 \\
+               satclip-resnet50-l10.ckpt
+
+    2. **satclip package**: if the ``satclip`` pip package is installed,
+       load via ``satclip.load()``.
+
+    3. **RFF proxy** (fallback): a random-Fourier-features encoder using
+       satellite-scale sigma values (4, 64, 1024).  No pretrained weights;
+       provides complementary frequency content to GeoCLIP's (1, 16, 256).
 
     Input  : (B, 2)  [lat, lon] in degrees
     Output : (B, 512) L2-normalised embedding
     """
-    def __init__(self, freeze: bool = True):
+    def __init__(self, freeze: bool = True, ckpt_path: str | None = None):
         super().__init__()
         self._loaded_official = False
-        try:
-            import satclip                                           # type: ignore
-            self.encoder = satclip.load()
-            self._loaded_official = True
-            print("[SatCLIPEncoder] loaded official SatCLIP weights ✓")
-        except Exception:
+
+        # ── Strategy 1: local checkpoint ─────────────────────────────────
+        if ckpt_path is not None:
+            try:
+                from .satclip_src.load_satclip import load_satclip_loc_encoder
+                self.encoder = load_satclip_loc_encoder(ckpt_path, device="cpu")
+                self._loaded_official = True
+                self._from_ckpt = True
+                print(f"[SatCLIPEncoder] loaded from checkpoint: {ckpt_path} ✓")
+            except Exception as e:
+                print(f"[SatCLIPEncoder] checkpoint load failed ({e}); trying satclip package")
+
+        # ── Strategy 2: satclip package ───────────────────────────────────
+        if not self._loaded_official:
+            try:
+                import satclip                                       # type: ignore
+                self.encoder = satclip.load()
+                self._loaded_official = True
+                self._from_ckpt = False
+                print("[SatCLIPEncoder] loaded official SatCLIP weights ✓")
+            except Exception:
+                pass
+
+        # ── Strategy 3: RFF proxy ─────────────────────────────────────────
+        if not self._loaded_official:
             print("[SatCLIPEncoder] satclip not available → using RFF proxy")
             self.encoder = _SatCLIPProxy()
+            self._from_ckpt = False
 
         if freeze:
             for p in self.encoder.parameters():
                 p.requires_grad_(False)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        if self._loaded_official:
+        if self._loaded_official and self._from_ckpt:
+            # checkpoint model expects double; returns raw embedding → normalise
+            with torch.no_grad():
+                emb = self.encoder(coords.double()).float()
+            return F.normalize(emb, dim=-1)
+        elif self._loaded_official:
             with torch.no_grad():
                 return F.normalize(self.encoder.encode_location(coords), dim=-1)
         else:
@@ -133,12 +171,22 @@ class LocationFusion(nn.Module):
 
     Input  : coords (B, 2)
     Output : e_loc  (B, loc_proj_dim)
+
+    Parameters
+    ----------
+    satclip_ckpt : str | None
+        Path to a locally downloaded SatCLIP checkpoint (.ckpt).
+        If None, falls back to the satclip package or RFF proxy.
+        Download from HuggingFace, e.g.::
+
+            huggingface-cli download microsoft/SatCLIP-ResNet50-L10 \\
+                satclip-resnet50-l10.ckpt
     """
     def __init__(self, geo_dim: int = 512, sat_dim: int = 512,
-                 out_dim: int = 256):
+                 out_dim: int = 256, satclip_ckpt: str | None = None):
         super().__init__()
         self.geo_enc = GeoCLIPEncoder()
-        self.sat_enc = SatCLIPEncoder(freeze=True)
+        self.sat_enc = SatCLIPEncoder(freeze=True, ckpt_path=satclip_ckpt)
 
         # Single linear layer — minimal MLP philosophy
         self.proj = nn.Linear(geo_dim + sat_dim, out_dim, bias=True)
