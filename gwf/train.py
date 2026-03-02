@@ -50,7 +50,7 @@ def r2(y_hat: torch.Tensor, y: torch.Tensor) -> float:
 
 def train(cfg: GWFConfig, source: str = "synthetic",
           visualise: bool = False, device: str = "cpu",
-          csv_path: str | None = None,
+          csv_path: str | None = None, geojson_path: str | None = None,
           lat_col: str = "lat", lon_col: str = "lon",
           target_col: str = "price", feature_cols: list | None = None):
 
@@ -70,6 +70,7 @@ def train(cfg: GWFConfig, source: str = "synthetic",
         seed=cfg.seed,
         n_samples=cfg.n_samples,
         csv_path=csv_path,
+        geojson_path=geojson_path,
         lat_col=lat_col,
         lon_col=lon_col,
         target_col=target_col,
@@ -233,10 +234,12 @@ Examples:
       --features area rooms age dist_subway --visualise    # select features
 """)
     parser.add_argument("--source",    default="synthetic",
-                        choices=["synthetic", "california", "custom"])
-    # ── Custom dataset ────────────────────────────────────────────────────
+                        choices=["synthetic", "california", "custom", "geojson"])
+    # ── Custom / GeoJSON dataset ──────────────────────────────────────────
     parser.add_argument("--csv",        default=None,
                         metavar="PATH",  help="path to your CSV file")
+    parser.add_argument("--geojson",    default=None,
+                        metavar="PATH",  help="path to GeoJSON FeatureCollection")
     parser.add_argument("--lat_col",    default="lat",
                         help="latitude column name  (default: lat)")
     parser.add_argument("--lon_col",    default="lon",
@@ -274,6 +277,7 @@ Examples:
           visualise=args.visualise,
           device=args.device,
           csv_path=args.csv,
+          geojson_path=args.geojson,
           lat_col=args.lat_col,
           lon_col=args.lon_col,
           target_col=args.target,

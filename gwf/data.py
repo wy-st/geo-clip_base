@@ -234,10 +234,69 @@ class SpatialRegressionDataset(Dataset):
         }
 
 
+def load_geojson_dataset(path: str,
+                         target_col: str = "log_price",
+                         feature_cols: list | None = None,
+                         standardize_y: bool = True):
+    """
+    Load a GeoJSON FeatureCollection (Point geometry) into the GWF format.
+
+    Coordinates are read from geometry.coordinates = [lon, lat].
+
+    Returns
+    -------
+    coords : float32 ndarray (n, 2)  — [lat, lon]
+    X      : float32 ndarray (n, p)  — standardised tabular features
+    y      : float32 ndarray (n,)    — (optionally standardised) target
+    """
+    import json
+    import pandas as pd
+
+    with open(path) as f:
+        geojson = json.load(f)
+
+    features = geojson["features"]
+    lats, lons, targets = [], [], []
+    prop_rows = []
+    for feat in features:
+        lon, lat = feat["geometry"]["coordinates"]
+        lats.append(lat); lons.append(lon)
+        prop_rows.append(feat["properties"])
+        targets.append(feat["properties"][target_col])
+
+    props_df = pd.DataFrame(prop_rows)
+
+    if feature_cols is None:
+        exclude = {target_col}
+        numeric_cols = props_df.select_dtypes(include=[np.number]).columns.tolist()
+        feature_cols = [c for c in numeric_cols if c not in exclude]
+
+    coords = np.stack([lats, lons], axis=1).astype(np.float32)
+    X_raw  = props_df[feature_cols].values.astype(np.float64)
+
+    col_medians = np.nanmedian(X_raw, axis=0)
+    nan_mask = np.isnan(X_raw)
+    X_raw[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X_raw).astype(np.float32)
+
+    y = np.array(targets, dtype=np.float32)
+    if standardize_y:
+        y = ((y - y.mean()) / (y.std() + 1e-8)).astype(np.float32)
+
+    print(f"[load_geojson] n={len(y)}, p={X.shape[1]}, features={feature_cols}")
+    print(f"  lat ∈ [{coords[:,0].min():.3f}, {coords[:,0].max():.3f}]  "
+          f"lon ∈ [{coords[:,1].min():.3f}, {coords[:,1].max():.3f}]")
+
+    return coords, X, y
+
+
 def get_dataloaders(source="synthetic", k=16, val_split=0.2,
                     batch_size=256, seed=42, n_samples=5000,
-                    # ── custom dataset options ──────────────────────────────
-                    csv_path: str | None = None,
+                    # ── custom / geojson dataset options ───────────────────
+                    csv_path:     str | None = None,
+                    geojson_path: str | None = None,
                     lat_col:    str = "lat",
                     lon_col:    str = "lon",
                     target_col: str = "price",
@@ -263,6 +322,11 @@ def get_dataloaders(source="synthetic", k=16, val_split=0.2,
     """
     if source == "california":
         coords, X, y = load_california_housing()
+    elif source == "geojson":
+        if geojson_path is None:
+            raise ValueError("source='geojson' requires geojson_path=")
+        coords, X, y = load_geojson_dataset(
+            geojson_path, target_col=target_col, feature_cols=feature_cols)
     elif source == "custom":
         if coords is not None and X is not None and y is not None:
             # Arrays passed directly — use as-is
