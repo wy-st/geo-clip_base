@@ -1,24 +1,18 @@
 """
-GWF — Geographical Weights Foundation Model
-============================================
+GWF — Geographical Weights Foundation Model  (v2)
+==================================================
 
-A foundation-model approach to Geographically Weighted Regression (GWR)
-that combines:
-
-  • GeoCLIP   — pretrained geographic location encoder (frozen)
-  • SatCLIP   — satellite-scale location encoder (frozen)
-  • TabPFN    — pretrained in-context encoder; pre-MLP hidden states used
-                as context-aware tabular embeddings (frozen)
-  • Dynamic kernel matrix K_i ∈ R^{p×p} — high-dimensional feature mixing
-  • Closed-form matrix WLS — explicit, interpretable local regression
+Combines:
+  • GeoCLIP  — pretrained geographic location encoder (frozen)
+  • TabPFN   — pretrained in-context encoder (frozen)
+  • GWRContextModule — y-injection + spatial attention + context-driven β
 
 Key properties
 --------------
-  • β_i ∈ R^p per query point — high-dimensional local coefficients,
-    visualisable on the map via t-SNE (no scalar bottleneck)
-  • Minimal trainable layers — only single linear layers sit on top of
-    frozen base models, preserving their learned representations
-  • Differentiable WLS — end-to-end trainable via torch.linalg.solve
+  • β_i ∈ R^E per query point — spatially-varying GWR-style coefficients,
+    visualisable on the map via PCA / UMAP
+  • k is a pure hyperparameter — no z_proj_dim ≤ k constraint
+  • y_nbr injected into neighbour representations; β shaped by local labels
 
 Quick start
 -----------
@@ -30,9 +24,10 @@ Quick start
 """
 
 from .config          import GWFConfig
-from .data            import get_dataloaders, SpatialRegressionDataset, load_custom_dataset
-from .encoders        import GeoCLIPEncoder, SatCLIPEncoder, LocationFusion
-from .kernel          import DynamicKernelGenerator
+from .data            import (get_dataloaders, SpatialRegressionDataset,
+                               load_custom_dataset, load_geojson_dataset)
+from .encoders        import GeoCLIPEncoder, LocationFusion
+from .kernel          import GWRContextModule
 from .regression      import MatrixGWR
 from .tabpfn_encoder  import TabPFNInContextEncoder
 from .model           import GWF
@@ -41,11 +36,11 @@ __all__ = [
     "GWFConfig",
     "get_dataloaders",
     "load_custom_dataset",
+    "load_geojson_dataset",
     "SpatialRegressionDataset",
     "GeoCLIPEncoder",
-    "SatCLIPEncoder",
     "LocationFusion",
-    "DynamicKernelGenerator",
+    "GWRContextModule",
     "MatrixGWR",
     "TabPFNInContextEncoder",
     "GWF",

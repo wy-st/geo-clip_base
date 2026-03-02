@@ -1,46 +1,46 @@
 """
-GWF — Geographical Weights Foundation Model (GNNWR-style, TabPFN embedding space)
+GWF — Geographical Weights Foundation Model  (v2)
 
-Full pipeline for one forward pass (B query points, each with k neighbours):
+Pipeline (B query points, each with k neighbours):
 
   coords (B,2), x (B,p), nbr_x (B,k,p), nbr_y (B,k)
         │
-        ├─ LocationFusion (GeoCLIP + SatCLIP, frozen)
-        │       └─ e_loc  (B, loc_proj_dim)          ← 1 linear layer
+        ├─ LocationFusion (GeoCLIP, frozen)
+        │       └─ e_loc  (B, loc_proj_dim)
         │
         ├─ TabPFNInContextEncoder (pretrained TabPFN, frozen)
-        │       ├─ input : x_query (B,p) | x_nbr (B,k,p) | y_nbr (B,k)
-        │       ├─ z_query (B, tabpfn_dim)            ← pre-MLP hidden state
-        │       └─ z_nbr   (B, k, tabpfn_dim)         ← neighbours' pre-MLP states
+        │       ├─ z_query (B, tabpfn_dim)   ← pre-MLP hidden state
+        │       └─ z_nbr   (B, k, tabpfn_dim)
         │
-        ├─ Node projection: concat(z, e_loc) → h  (B, node_dim)  ← 1 linear
+        ├─ node_proj: concat(z, e_loc) → GELU → h  (B, node_dim)
         │   (shared weights for query and neighbour nodes)
         │
-        ├─ DynamicKernelGenerator  (GNNWR-style learned spatial weighting)
-        │       ├─ K_z (B, tabpfn_dim, z_proj_dim)   — adaptive z-space projection
-        │       │       generated via low-rank U @ V^T from h_query
-        │       └─ w_i  (B, k)                        — spatial attention weights
-        │
-        └─ MatrixGWR  (WLS in the TabPFN embedding space)
-                ├─ Z̃ = z_nbr @ K_z                   (project TabPFN embeddings)
-                ├─ β_i = WLS(Z̃, y_nbr, w_i)          ← closed form, dim=z_proj_dim
-                └─ ŷ_i = (z_query @ K_z) · β_i
+        └─ GWRContextModule  (k-agnostic, end-to-end)
+                ├─ y-inject: h_nbr + f(y_nbr) → h_aug (B, k, H)
+                ├─ attn(h_query, h_aug, dist) → w (B, k)
+                ├─ context = Σ w_j · h_aug_j   (B, H)
+                ├─ β_i = beta_head(h_query + context)  (B, E)
+                └─ ŷ_i = (z_query @ W_static) · β_i   (B,)
 
-Key design insight (from GNNWR):
-  Spatial weights w_i are learned from contextual node representations h_i/h_j
-  (encoding both spatial position and tabular context) rather than a fixed kernel.
-  The WLS regression operates in the TabPFN hidden-feature space (z), which
-  captures the in-context distribution of neighbours and is richer than raw x.
+Design properties
+-----------------
+• k is a pure hyperparameter — no z_proj_dim ≤ k/2 constraint
+• y_nbr is directly injected into neighbour representations, giving the
+  spatial attention weights (and hence β) full access to local label info
+• β_i ∈ R^E is a spatially-varying local coefficient vector, interpretable
+  on the map (GWR spirit preserved)
+• Trainable layers only on top of frozen base models (GeoCLIP, TabPFN)
 
-Trainable parameters live ONLY in:
-  • LocationFusion.proj          (1 linear)
-  • NodeProjection               (1 linear)
-  • DynamicKernelGenerator       (3 linear — z_kernel, query, key heads)
-
-Frozen:
-  • GeoCLIP encoder              (pretrained)
-  • SatCLIP proxy                (pretrained / RFF)
-  • TabPFN PerFeatureTransformer (pretrained)
+Trainable parameters
+--------------------
+  loc_enc.proj         : 512 → loc_proj_dim
+  node_proj            : (tabpfn_dim + loc_proj_dim) → node_dim
+  ctx_mod.y_proj       : 1 → y_inject_dim
+  ctx_mod.y_inject     : y_inject_dim → node_dim
+  ctx_mod.query_head   : node_dim → attn_dim
+  ctx_mod.key_head     : node_dim → attn_dim
+  ctx_mod.W_static     : tabpfn_dim × z_proj_dim
+  ctx_mod.beta_head    : node_dim → z_proj_dim
 """
 
 import torch
@@ -48,83 +48,62 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoders       import LocationFusion
-from .kernel         import DynamicKernelGenerator
-from .regression     import MatrixGWR
+from .kernel         import GWRContextModule
 from .tabpfn_encoder import TabPFNInContextEncoder
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main GWF Model
-# ─────────────────────────────────────────────────────────────────────────────
-
 class GWF(nn.Module):
     """
-    Geographical Weights Foundation Model.
+    Geographical Weights Foundation Model (v2).
 
     Parameters
     ----------
-    feat_dim     : number of raw tabular features  (p) — used by TabPFN encoder
-    loc_proj_dim : output dim of LocationFusion    (after GeoCLIP + SatCLIP fusion)
-    node_dim     : node representation dimension   (input to DynamicKernelGenerator)
-    z_proj_dim   : regression dimension in TabPFN embedding space
-                   (z_proj_dim << tabpfn_dim; determines β dimension)
-    kernel_rank  : low-rank factor r for K_z = U @ V^T
-    attn_dim     : query/key dim for spatial attention weights
-    wls_lambda   : ridge regularisation in WLS
-    tabpfn_path  : path to a local TabPFN regressor .ckpt file;
-                   None → try HuggingFace download
+    feat_dim      : number of raw tabular features (p)
+    loc_proj_dim  : GeoCLIP projection output dim   (default 64)
+    node_dim      : node representation dim         (default 128)
+    z_proj_dim    : β and z-projection dim (E)      (default 32)
+                    No constraint on k — freely tunable.
+    attn_dim      : query/key dim for attention     (default 64)
+    y_inject_dim  : embedding dim for y_nbr injection (default 8)
+    tabpfn_path   : local TabPFN .ckpt; None → HuggingFace download
     """
 
     def __init__(
         self,
-        feat_dim:      int        = 8,
-        loc_proj_dim:  int        = 256,
-        node_dim:      int        = 256,
-        z_proj_dim:    int        = 64,
-        kernel_rank:   int        = 4,
-        attn_dim:      int        = 64,
-        wls_lambda:    float      = 1e-3,
-        tabpfn_path:   str | None = None,
-        satclip_ckpt:  str | None = None,
+        feat_dim:     int        = 8,
+        loc_proj_dim: int        = 64,
+        node_dim:     int        = 128,
+        z_proj_dim:   int        = 32,
+        attn_dim:     int        = 64,
+        y_inject_dim: int        = 8,
+        tabpfn_path:  str | None = None,
     ):
         super().__init__()
 
         self.feat_dim   = feat_dim
         self.z_proj_dim = z_proj_dim
 
-        # ── Location encoder (GeoCLIP + SatCLIP, frozen) ──────────────────
-        self.loc_enc = LocationFusion(
-            geo_dim=512, sat_dim=512, out_dim=loc_proj_dim,
-            satclip_ckpt=satclip_ckpt)
-
-        # ── TabPFN in-context encoder (pretrained, frozen) ─────────────────
+        # ── Frozen base encoders ──────────────────────────────────────────
+        self.loc_enc = LocationFusion(geo_dim=512, out_dim=loc_proj_dim)
         self.ctx_enc = TabPFNInContextEncoder(model_path=tabpfn_path)
-        tabpfn_dim = self.ctx_enc.emb_dim   # TabPFN's ninp, e.g. 192
+        tabpfn_dim   = self.ctx_enc.emb_dim             # e.g. 192
 
-        # ── Node projection: [tabpfn_emb ‖ loc_proj] → node_dim ───────────
-        # Shared weights: used for both query and neighbour nodes
+        # ── Shared node projection ────────────────────────────────────────
         self.node_proj = nn.Linear(tabpfn_dim + loc_proj_dim, node_dim,
                                    bias=True)
 
-        # ── Dynamic kernel matrix and attention weights (GNNWR-style) ──────
-        self.kernel_gen = DynamicKernelGenerator(
-            node_dim=node_dim,
-            tabpfn_dim=tabpfn_dim,
-            z_proj_dim=z_proj_dim,
-            rank=kernel_rank,
-            attn_dim=attn_dim)
-
-        # ── Matrix WLS in TabPFN embedding space (no learnable parameters) ─
-        self.gwr = MatrixGWR(lam=wls_lambda)
+        # ── Context module (y-injection + attention + β generation) ───────
+        self.ctx_mod = GWRContextModule(
+            node_dim     = node_dim,
+            tabpfn_dim   = tabpfn_dim,
+            z_proj_dim   = z_proj_dim,
+            attn_dim     = attn_dim,
+            y_inject_dim = y_inject_dim,
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _project_node(
-        self,
-        z:     torch.Tensor,   # (*, tabpfn_dim)   — TabPFN embedding
-        e_loc: torch.Tensor,   # (*, loc_proj_dim) — location embedding
-    ) -> torch.Tensor:
-        """Shared node projection: concat(z, e_loc) → GELU → h (*, node_dim)."""
+    def _project_node(self, z, e_loc):
         return F.gelu(self.node_proj(torch.cat([z, e_loc], dim=-1)))
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -144,70 +123,61 @@ class GWF(nn.Module):
         Returns
         -------
         y_hat : (B,)            — predictions
-        beta  : (B, z_proj_dim) — local GWR coefficients in projected z-space
+        beta  : (B, z_proj_dim) — local GWR coefficients (spatially varying)
         """
-        coord     = batch["coord"]       # (B, 2)
-        x         = batch["x"]           # (B, p)
-        nbr_coord = batch["nbr_coord"]   # (B, k, 2)
-        nbr_x     = batch["nbr_x"]       # (B, k, p)
-        nbr_y     = batch["nbr_y"]       # (B, k)
-        nbr_dist  = batch["nbr_dist"]    # (B, k)
+        coord     = batch["coord"]
+        x         = batch["x"]
+        nbr_coord = batch["nbr_coord"]
+        nbr_x     = batch["nbr_x"]
+        nbr_y     = batch["nbr_y"]
+        nbr_dist  = batch["nbr_dist"]
 
         B, k, p = nbr_x.shape
 
-        # ── 1. TabPFN: context-aware embeddings (single forward call) ─────
-        # Neighbours serve as TabPFN's in-context training set (with labels).
-        # The query point is the "test" row — TabPFN never sees its label.
-        #
-        # z_query : (B, tabpfn_dim)    — query pre-MLP hidden state
-        # z_nbr   : (B, k, tabpfn_dim) — neighbour pre-MLP hidden states
-        z_query, z_nbr = self.ctx_enc(x, nbr_x, nbr_y)
+        # 1. TabPFN in-context embeddings
+        z_query, z_nbr = self.ctx_enc(x, nbr_x, nbr_y)    # (B,D), (B,k,D)
 
-        # ── 2. Location embeddings ─────────────────────────────────────────
-        e_loc_query = self.loc_enc(coord)        # (B, loc_proj_dim)
-        e_loc_nbr   = self.loc_enc(nbr_coord)    # (B, k, loc_proj_dim)
+        # 2. GeoCLIP location embeddings
+        e_loc_query = self.loc_enc(coord)                   # (B, L)
+        e_loc_nbr   = self.loc_enc(nbr_coord)               # (B, k, L)
 
-        # ── 3. Node projection (shared weights for query and neighbours) ───
-        h_query = self._project_node(z_query, e_loc_query)     # (B, node_dim)
+        # 3. Node projection (shared weights for query and neighbours)
+        h_query = self._project_node(z_query, e_loc_query)  # (B, H)
+        h_nbr   = self._project_node(
+            z_nbr.reshape(B * k, -1),
+            e_loc_nbr.reshape(B * k, -1),
+        ).reshape(B, k, -1)                                  # (B, k, H)
 
-        # Flatten neighbours, project with shared weights, then reshape
-        z_nbr_flat  = z_nbr.reshape(B * k, -1)               # (B*k, tabpfn_dim)
-        e_loc_nbr_f = e_loc_nbr.reshape(B * k, -1)           # (B*k, loc_proj_dim)
-        h_nbr = self._project_node(
-            z_nbr_flat, e_loc_nbr_f
-        ).reshape(B, k, -1)                                    # (B, k, node_dim)
-
-        # ── 4. K_z: location-adaptive z-space projection, w: spatial weights
-        # GNNWR-style: both are generated from the learned node representations
-        K_z = self.kernel_gen.get_z_kernel_matrix(h_query)          # (B, tabpfn_dim, z_proj_dim)
-        w   = self.kernel_gen.get_attention_weights(
-            h_query, h_nbr, dist=nbr_dist)                          # (B, k)
-
-        # ── 5. Matrix WLS in TabPFN embedding space ────────────────────────
-        # Z̃ = z @ K_z  →  β = WLS(Z̃, y, w)  →  ŷ = (z_query @ K_z) · β
-        y_hat, beta = self.gwr(z_query, K_z, z_nbr, nbr_y, w)      # (B,), (B,z_proj_dim)
+        # 4. Context module: y-injection → attention → β → prediction
+        y_hat, beta, _ = self.ctx_mod(
+            h_query, h_nbr, nbr_y, z_query, dist=nbr_dist)
 
         return y_hat, beta
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def loss(self, y_hat: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(y_hat, y_true)
 
     # ─────────────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def predict_with_betas(self, dataloader, device: str = "cpu"):
         """
-        Run inference over a full dataset, collecting predictions and β vectors.
+        Full-dataset inference. Returns predictions, β vectors, coords, labels.
 
         Returns
         -------
-        y_hat  : (N,)            — all predictions
-        betas  : (N, z_proj_dim) — local GWR coefficients in projected z-space
-        coords : (N, 2)          — query coordinates
-        y_true : (N,)            — ground-truth targets
+        y_hat  : (N,)
+        betas  : (N, z_proj_dim)  — spatially-varying GWR-style coefficients
+        coords : (N, 2)
+        y_true : (N,)
         """
         self.eval()
         all_yhat, all_beta, all_coord, all_y = [], [], [], []
         for batch in dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()
-                     if isinstance(v, torch.Tensor)}
+            batch = {kk: vv.to(device) for kk, vv in batch.items()
+                     if isinstance(vv, torch.Tensor)}
             yh, beta = self(batch)
             all_yhat.append(yh.cpu())
             all_beta.append(beta.cpu())

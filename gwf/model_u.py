@@ -1,15 +1,11 @@
 """
 GWF-U — GWF with BNN-style Uncertainty
 
-Architecture is identical to GWF.  The only difference is that the WLS step
-uses UncertainMatrixGWR, which adds one learnable scalar log_sigma and
-supports reparameterized β sampling at training time.
+Architecture is identical to GWF-v2.  Adds one learnable log_sigma that
+scales a noise perturbation on β, supporting MC-dropout-style uncertainty.
 
 Training
 --------
-Sample ε from N(0, I) and pass it as eps_beta so that gradients flow through
-the sampled β via the reparameterization trick.  The loss is plain MSE:
-
     eps = torch.randn(B, model.z_proj_dim, device=device)
     y_hat, _ = model(batch, eps_beta=eps)
     loss = model.loss(y_hat, batch["y"])
@@ -25,61 +21,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoders       import LocationFusion
-from .kernel         import DynamicKernelGenerator
-from .regression_u   import UncertainMatrixGWR
+from .kernel         import GWRContextModule
 from .tabpfn_encoder import TabPFNInContextEncoder
 
 
 class GWF_U(nn.Module):
     """
-    Parameters  (identical to GWF, minus nll_beta_weight)
+    Parameters
     ----------
-    feat_dim        : number of raw tabular features
-    loc_proj_dim    : output dim of LocationFusion
-    node_dim        : node representation dimension
-    z_proj_dim      : regression dim in TabPFN embedding space
-    kernel_rank     : low-rank factor r for K_z = U @ V^T
-    attn_dim        : query/key dim for spatial attention weights
-    wls_lambda      : ridge regularisation in WLS
-    tabpfn_path     : path to a local TabPFN regressor .ckpt;
-                      None → HuggingFace download
+    feat_dim      : number of raw tabular features
+    loc_proj_dim  : GeoCLIP projection output dim   (default 64)
+    node_dim      : node representation dim         (default 128)
+    z_proj_dim    : β and z-projection dim (E)      (default 32)
+    attn_dim      : query/key dim for attention     (default 64)
+    y_inject_dim  : embedding dim for y_nbr injection (default 8)
+    tabpfn_path   : local TabPFN .ckpt; None → HuggingFace download
     """
 
     def __init__(
         self,
-        feat_dim:      int        = 8,
-        loc_proj_dim:  int        = 256,
-        node_dim:      int        = 256,
-        z_proj_dim:    int        = 64,
-        kernel_rank:   int        = 4,
-        attn_dim:      int        = 64,
-        wls_lambda:    float      = 1e-3,
-        tabpfn_path:   str | None = None,
-        satclip_ckpt:  str | None = None,
+        feat_dim:     int        = 8,
+        loc_proj_dim: int        = 64,
+        node_dim:     int        = 128,
+        z_proj_dim:   int        = 32,
+        attn_dim:     int        = 64,
+        y_inject_dim: int        = 8,
+        tabpfn_path:  str | None = None,
     ):
         super().__init__()
 
         self.feat_dim   = feat_dim
         self.z_proj_dim = z_proj_dim
 
-        self.loc_enc = LocationFusion(
-            geo_dim=512, sat_dim=512, out_dim=loc_proj_dim,
-            satclip_ckpt=satclip_ckpt)
-
+        self.loc_enc = LocationFusion(geo_dim=512, out_dim=loc_proj_dim)
         self.ctx_enc = TabPFNInContextEncoder(model_path=tabpfn_path)
-        tabpfn_dim = self.ctx_enc.emb_dim
+        tabpfn_dim   = self.ctx_enc.emb_dim
 
         self.node_proj = nn.Linear(tabpfn_dim + loc_proj_dim, node_dim, bias=True)
 
-        self.kernel_gen = DynamicKernelGenerator(
-            node_dim=node_dim,
-            tabpfn_dim=tabpfn_dim,
-            z_proj_dim=z_proj_dim,
-            rank=kernel_rank,
-            attn_dim=attn_dim)
+        self.ctx_mod = GWRContextModule(
+            node_dim     = node_dim,
+            tabpfn_dim   = tabpfn_dim,
+            z_proj_dim   = z_proj_dim,
+            attn_dim     = attn_dim,
+            y_inject_dim = y_inject_dim,
+        )
 
-        # UncertainMatrixGWR adds one learnable log_sigma over plain GWF
-        self.gwr = UncertainMatrixGWR(lam=wls_lambda)
+        # Learnable noise scale for BNN reparameterisation
+        self.log_sigma = nn.Parameter(torch.zeros(1))
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -92,19 +81,6 @@ class GWF_U(nn.Module):
                 batch:    dict,
                 eps_beta: torch.Tensor | None = None,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        batch    : dict with keys coord, x, nbr_coord, nbr_x, nbr_y, nbr_dist
-        eps_beta : (B, z_proj_dim) | None
-                   External noise for BNN reparameterization.
-                   None → deterministic MAP prediction.
-
-        Returns
-        -------
-        y_hat : (B,)           — point prediction
-        beta  : (B, z_proj_dim) — MAP local coefficients μ_β
-        """
         coord     = batch["coord"]
         x         = batch["x"]
         nbr_coord = batch["nbr_coord"]
@@ -125,17 +101,20 @@ class GWF_U(nn.Module):
             e_loc_nbr.reshape(B * k, -1),
         ).reshape(B, k, -1)
 
-        K_z = self.kernel_gen.get_z_kernel_matrix(h_query)
-        w   = self.kernel_gen.get_attention_weights(h_query, h_nbr, dist=nbr_dist)
+        y_hat, beta, _ = self.ctx_mod(
+            h_query, h_nbr, nbr_y, z_query, dist=nbr_dist)
 
-        y_hat, beta = self.gwr(z_query, K_z, z_nbr, nbr_y, w, eps_beta=eps_beta)
+        if eps_beta is not None:
+            # Reparameterisation: perturb β by learnable σ
+            sigma  = self.log_sigma.exp()
+            z_proj = z_query @ self.ctx_mod.W_static     # (B, E)
+            y_hat  = y_hat + (z_proj * (sigma * eps_beta)).sum(dim=-1)
 
         return y_hat, beta
 
     # ─────────────────────────────────────────────────────────────────────────
 
     def loss(self, y_hat: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Plain MSE — no distributional assumption."""
         return F.mse_loss(y_hat, y_true)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -146,21 +125,6 @@ class GWF_U(nn.Module):
                                  device: str = "cpu",
                                  n_mc:   int = 50,
                                  ) -> tuple:
-        """
-        Monte-Carlo inference.
-
-        For each sample run a stochastic forward pass with ε ~ N(0, I);
-        the standard deviation across samples is the predictive uncertainty.
-        The point estimate is the deterministic MAP (ε = 0).
-
-        Returns
-        -------
-        y_hat  : (N,)            — MAP point predictions
-        sigma  : (N,)            — predictive std  (MC estimate)
-        betas  : (N, z_proj_dim) — MAP local coefficients
-        coords : (N, 2)
-        y_true : (N,)
-        """
         self.eval()
         e = self.z_proj_dim
         all_yhat, all_sigma, all_beta, all_coord, all_y = [], [], [], [], []
@@ -170,16 +134,14 @@ class GWF_U(nn.Module):
                      if isinstance(vv, torch.Tensor)}
             B = batch["coord"].shape[0]
 
-            # MAP point estimate
             yh_map, beta_map = self(batch)
 
-            # MC samples for σ
             preds = []
             for _ in range(n_mc):
                 eps = torch.randn(B, e, device=device)
                 yh_i, _ = self(batch, eps_beta=eps)
                 preds.append(yh_i)
-            sigma = torch.stack(preds).std(dim=0)   # (B,)
+            sigma = torch.stack(preds).std(dim=0)
 
             all_yhat.append(yh_map.cpu())
             all_sigma.append(sigma.cpu())

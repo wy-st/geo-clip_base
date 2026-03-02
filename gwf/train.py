@@ -85,9 +85,8 @@ def train(cfg: GWFConfig, source: str = "synthetic",
         loc_proj_dim = cfg.loc_proj_dim,
         node_dim     = cfg.node_dim,
         z_proj_dim   = cfg.z_proj_dim,
-        kernel_rank  = cfg.kernel_rank,
         attn_dim     = cfg.attn_dim,
-        wls_lambda   = cfg.wls_lambda,
+        y_inject_dim = cfg.y_inject_dim,
         tabpfn_path  = cfg.tabpfn_path,
     ).to(device)
 

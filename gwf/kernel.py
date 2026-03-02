@@ -1,126 +1,126 @@
 """
-GWF — Dynamic Kernel Generator (GNNWR-style)
+GWF — Spatial Context Module
 
-Inspired by GNNWR (Du et al., IJGIS 2020): a neural network learns the
-spatial weight function from contextual node representations, replacing the
-fixed kernel of classical GWR.
+Replaces the WLS + DynamicKernelGenerator pair with a single module that:
 
-Given the aggregated node representation h_i (TabPFN embedding + location),
-this module produces:
+  1. Injects y_nbr into neighbour node representations → h_aug
+     (allows spatial attention to consider the local label distribution)
 
-  1. K_z ∈ R^{tabpfn_dim × z_proj_dim}  — low-rank adaptive projection
-       K_z = U_i @ V_i^T,   U_i ∈ R^{tabpfn_dim × rank},
-                              V_i ∈ R^{z_proj_dim × rank}
-     Applied as:  Z̃ = z_nbr @ K_z   (project TabPFN hidden features)
-     This projects context-aware TabPFN embeddings into a location-adaptive
-     subspace for the WLS regression.
+  2. Computes cross-attention weights from h_query → h_aug
+     with an optional geographic distance prior
 
-  2. w_ij ∈ R^{k}  — scalar spatial attention weights over neighbours,
-     computed via cross-attention:  q_i (from h_i) · k_j (from h_j)
-     Softmax-normalised so Σ_j w_ij = 1.
+  3. Aggregates neighbours via weighted sum → context vector
 
-Both outputs are produced by a single linear layer each, preserving the
-rich representations from the frozen base models (TabPFN + GeoCLIP).
+  4. Generates local β coefficients:
+        β_i = beta_head(h_query + context)   ∈ R^{z_proj_dim}
+     β is a spatially-varying vector; can be visualised on the map.
+
+  5. Predicts via a shared static projection W ∈ R^{tabpfn_dim × z_proj_dim}:
+        ŷ_i = (z_query @ W) · β_i
+
+This design decouples k completely from model parameters:
+  • k is a pure hyperparameter (no z_proj_dim ≤ k/2 constraint)
+  • The β generation is stable for any k ≥ 1
+
+Trainable parameters:
+  y_proj   : 1 → y_inject_dim  (tiny — embeds scalar y into feature space)
+  y_inject : y_inject_dim → H  (add to h_nbr)
+  query/key heads               (spatial attention)
+  W_static                      (tabpfn_dim → z_proj_dim, shared projection)
+  beta_head : H → z_proj_dim   (generates local β from fused representation)
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
-class DynamicKernelGenerator(nn.Module):
+class GWRContextModule(nn.Module):
     """
+    Context-driven β generation for Geographically Weighted Regression.
+
     Parameters
     ----------
-    node_dim    : dimension of the aggregated node representation h_i
-    tabpfn_dim  : TabPFN hidden-state dimension (emb_dim from TabPFNInContextEncoder)
-    z_proj_dim  : projection dimension for WLS regression (z_proj_dim << tabpfn_dim)
-    rank        : low-rank factorisation rank r for K_z = U @ V^T
-    attn_dim    : query/key dimension for spatial attention weights
+    node_dim      : dimension of the node representation h_i (from node_proj)
+    tabpfn_dim    : TabPFN hidden-state dimension (D)
+    z_proj_dim    : β and projection dimension (E)
+                    No constraint on k — freely set as a model hyperparameter.
+    attn_dim      : query/key dimension for spatial attention (A)
+    y_inject_dim  : small embedding dimension for y_nbr injection (default 8)
     """
 
-    def __init__(self, node_dim: int, tabpfn_dim: int,
-                 z_proj_dim: int = 64, rank: int = 4, attn_dim: int = 64):
+    def __init__(self,
+                 node_dim:     int,
+                 tabpfn_dim:   int,
+                 z_proj_dim:   int = 32,
+                 attn_dim:     int = 64,
+                 y_inject_dim: int = 8):
         super().__init__()
-        self.tabpfn_dim = tabpfn_dim
-        self.z_proj_dim = z_proj_dim
-        self.rank       = rank
-        self.attn_dim   = attn_dim
+        self.tabpfn_dim   = tabpfn_dim
+        self.z_proj_dim   = z_proj_dim
+        self.attn_dim     = attn_dim
+        self.y_inject_dim = y_inject_dim
 
-        # ── K_z: (tabpfn_dim, z_proj_dim) low-rank factorisation ──────────
-        # h_i → (U_i, V_i)  where K_z = U_i @ V_i^T
-        # U_i ∈ R^{tabpfn_dim × rank},  V_i ∈ R^{z_proj_dim × rank}
-        # Output size: (tabpfn_dim + z_proj_dim) * rank
-        self.z_kernel_head = nn.Linear(
-            node_dim, (tabpfn_dim + z_proj_dim) * rank, bias=False)
+        # ── y-injection into neighbour representations ────────────────────
+        # Projects scalar y_nbr → y_inject_dim, then adds to h_nbr
+        self.y_proj   = nn.Sequential(nn.Linear(1, y_inject_dim), nn.Tanh())
+        self.y_inject = nn.Linear(y_inject_dim, node_dim, bias=False)
 
-        # ── Spatial attention: query from h_i, key from neighbour h_j ─────
+        # ── Spatial attention (query attends to y-augmented neighbours) ───
         self.query_head = nn.Linear(node_dim, attn_dim, bias=False)
         self.key_head   = nn.Linear(node_dim, attn_dim, bias=False)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        # Small init so K_z starts near zero — the regression begins close to
-        # raw z features before learning location-specific projections.
-        nn.init.normal_(self.z_kernel_head.weight, std=0.01)
         nn.init.xavier_uniform_(self.query_head.weight)
         nn.init.xavier_uniform_(self.key_head.weight)
 
-    # ── K_z generation ───────────────────────────────────────────────────────
+        # ── Shared static projection: tabpfn_dim → z_proj_dim ─────────────
+        self.W_static = nn.Parameter(torch.zeros(tabpfn_dim, z_proj_dim))
+        nn.init.normal_(self.W_static, std=0.02)
 
-    def get_z_kernel_matrix(self, h: torch.Tensor) -> torch.Tensor:
+        # ── β generation head: fused representation → local coefficients ──
+        self.beta_head = nn.Linear(node_dim, z_proj_dim, bias=True)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def forward(self,
+                h_query: torch.Tensor,         # (B, H)   query node repr
+                h_nbr:   torch.Tensor,         # (B, k, H) neighbour node repr
+                y_nbr:   torch.Tensor,         # (B, k)   neighbour labels
+                z_query: torch.Tensor,         # (B, D)   query TabPFN emb
+                dist:    torch.Tensor | None,  # (B, k) | None  geographic dist
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Generate the location-adaptive z-space projection matrix.
-
-        h   : (B, node_dim)
-        Returns K_z : (B, tabpfn_dim, z_proj_dim)   low-rank  K_z = U @ V^T
-
-        The projection maps TabPFN hidden features from tabpfn_dim → z_proj_dim
-        in a location-aware manner, allowing each query point to select the
-        most relevant dimensions of the in-context embeddings for local regression.
+        Returns
+        -------
+        y_hat  : (B,)            — point prediction
+        beta   : (B, z_proj_dim) — local GWR coefficients (spatially varying)
+        w      : (B, k)          — spatial attention weights (for inspection)
         """
-        d, e, r = self.tabpfn_dim, self.z_proj_dim, self.rank
-        uv = self.z_kernel_head(h)                    # (B, (d+e)*r)
-        U  = uv[:, :d * r].reshape(-1, d, r)          # (B, tabpfn_dim, rank)
-        V  = uv[:, d * r:].reshape(-1, e, r)          # (B, z_proj_dim, rank)
-        K_z = torch.matmul(U, V.transpose(-1, -2))    # (B, tabpfn_dim, z_proj_dim)
-        return K_z
+        # 1. y-inject: augment h_nbr with local label information
+        y_feat = self.y_proj(y_nbr.unsqueeze(-1))     # (B, k, y_inject_dim)
+        h_aug  = h_nbr + self.y_inject(y_feat)         # (B, k, H)
 
-    # ── Attention weights w_ij ───────────────────────────────────────────────
-
-    def get_attention_weights(self,
-                              h_query: torch.Tensor,
-                              h_keys:  torch.Tensor,
-                              dist:    torch.Tensor | None = None
-                              ) -> torch.Tensor:
-        """
-        Compute learned spatial attention weights over neighbours (GNNWR-style).
-
-        Unlike GNNWR's SWNN (which takes a distance vector as input), we use
-        cross-attention between richer node representations that encode both
-        spatial position (via GeoCLIP/SatCLIP) and tabular context (via TabPFN).
-
-        h_query : (B, node_dim)
-        h_keys  : (B, k, node_dim)
-        dist    : (B, k) optional geographic distances — added as a soft prior
-                  so nearer neighbours still tend to get higher weight
-                  (distance-decay inductive bias, learnable to override)
-
-        Returns w : (B, k)  — spatial weights, sum to 1
-        """
-        q = self.query_head(h_query)                     # (B, attn_dim)
-        k = self.key_head(h_keys)                        # (B, k, attn_dim)
-
-        # Scaled dot-product attention
+        # 2. Attention scores: h_query ↔ y-augmented neighbours
+        q = self.query_head(h_query)                   # (B, A)
+        k = self.key_head(h_aug)                       # (B, k, A)
         scale  = math.sqrt(self.attn_dim)
-        scores = torch.einsum("bd,bkd->bk", q, k) / scale  # (B, k)
+        scores = torch.einsum("ba,bka->bk", q, k) / scale   # (B, k)
 
-        # Optional distance decay prior
         if dist is not None:
-            # Normalise distances to [0,1] and subtract (closer → less penalty)
-            d_norm = dist / (dist.max(dim=-1, keepdim=True).values + 1e-8)
-            scores = scores - d_norm                        # soft distance bias
+            d_norm  = dist / (dist.max(dim=-1, keepdim=True).values + 1e-8)
+            scores  = scores - d_norm
 
-        return F.softmax(scores, dim=-1)                 # (B, k)
+        w = F.softmax(scores, dim=-1)                  # (B, k)
+
+        # 3. Weighted aggregation → context vector
+        context = torch.einsum("bk,bkh->bh", w, h_aug)  # (B, H)
+
+        # 4. β generation from query + context
+        h_fused = h_query + context                     # (B, H)  residual
+        beta    = self.beta_head(h_fused)               # (B, E)
+
+        # 5. Predict via dot product in projected z-space
+        z_proj  = z_query @ self.W_static               # (B, E)
+        y_hat   = (z_proj * beta).sum(dim=-1)           # (B,)
+
+        return y_hat, beta, w
