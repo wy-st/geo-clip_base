@@ -6,3 +6,8 @@ dist/
 build/
 .eggs/
 gwf_beta_tsne_*.png
+
+# Model checkpoints (binary, can be large)
+checkpoints/
+*.pt
+*.ckpt
