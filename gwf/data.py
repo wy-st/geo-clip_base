@@ -217,12 +217,17 @@ class SpatialRegressionDataset(Dataset):
         self.nbr_idx  = torch.from_numpy(nbr_idx)
         self.nbr_dist = torch.from_numpy(nbr_dist)
 
+        # 预计算的 TabPFN 嵌入（可选）
+        # 设置后 __getitem__ 会把它们加入 batch，model.forward 会直接用
+        self.z_query: torch.Tensor | None = None  # (n, D)
+        self.z_nbr:   torch.Tensor | None = None  # (n, k, D)
+
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        nbr = self.nbr_idx[idx]          # (k,)
-        return {
+        nbr  = self.nbr_idx[idx]          # (k,)
+        item = {
             "idx":        idx,
             "coord":      self.coords[idx],        # (2,)
             "x":          self.X[idx],             # (p,)
@@ -232,6 +237,10 @@ class SpatialRegressionDataset(Dataset):
             "nbr_y":      self.y[nbr],             # (k,)
             "nbr_dist":   self.nbr_dist[idx],      # (k,)
         }
+        if self.z_query is not None:
+            item["z_query"] = self.z_query[idx]    # (D,)
+            item["z_nbr"]   = self.z_nbr[idx]      # (k, D)
+        return item
 
 
 def load_geojson_dataset(path: str,
