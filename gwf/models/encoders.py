@@ -270,10 +270,13 @@ class TabPFNEncoder(nn.Module):
         try:
             from tabpfn import TabPFNRegressor  # type: ignore
 
-            # Build kwargs: support both old API (N_ensemble_configurations)
-            # and new API v6+ (n_estimators).  Also pass explicit model_path
-            # if a checkpoint file is provided.
-            kwargs: dict = {"device": device, "n_estimators": 1}
+            # Build kwargs for v6+ API.  ignore_pretraining_limits=True
+            # allows CPU inference on >1000 samples (slower but functional).
+            kwargs: dict = {
+                "device": device,
+                "n_estimators": 1,
+                "ignore_pretraining_limits": True,
+            }
             if ckpt_path and Path(ckpt_path).exists():
                 kwargs["model_path"] = ckpt_path
                 logger.info(f"TabPFN: using checkpoint {ckpt_path}")
@@ -292,16 +295,27 @@ class TabPFNEncoder(nn.Module):
             self._rff_W = torch.randn(feat_dim, out_dim, generator=gen)
         return self._rff_W.to(device)
 
+    # Max context size for CPU (TabPFN is O(N²) — keep it fast)
+    _MAX_CONTEXT = 1000
+
     def fit_context(self, X_tab: torch.Tensor, y: torch.Tensor):
         """
         Fit TabPFN on the full training set as context.
         Call once before training (not on every batch).
+        On CPU, subsamples to _MAX_CONTEXT rows for reasonable speed.
         """
         if not self._available:
             return
-        self._tabpfn.fit(X_tab.cpu().numpy(), y.cpu().numpy())
+        N = X_tab.shape[0]
+        if N > self._MAX_CONTEXT:
+            idx = torch.randperm(N, generator=torch.Generator().manual_seed(42))[: self._MAX_CONTEXT]
+            X_ctx, y_ctx = X_tab[idx], y[idx]
+            logger.info(f"TabPFN: subsampling context {N} → {self._MAX_CONTEXT} for CPU speed.")
+        else:
+            X_ctx, y_ctx = X_tab, y
+        self._tabpfn.fit(X_ctx.cpu().numpy(), y_ctx.cpu().numpy())
         self._fitted = True
-        logger.info(f"TabPFN context fitted on {X_tab.shape[0]} samples.")
+        logger.info(f"TabPFN context fitted on {X_ctx.shape[0]} samples.")
 
     @torch.no_grad()
     def forward(self, X_tab: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
