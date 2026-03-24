@@ -70,10 +70,13 @@ ENCODERS = {
     # ---- TabPFN: tabular encoder (REQUIRED) ----
     "tabpfn_ckpt":   "/root/.cache/tabpfn/tabpfn-v2-regressor.ckpt",
 
-    # ---- LLM: world knowledge encoder (REQUIRED) ----
-    # HuggingFace model name or local path.
-    # Recommended: "Qwen/Qwen2.5-7B" or "meta-llama/Llama-3.1-8B-Instruct"
-    "llm_name":      "Qwen/Qwen2.5-7B",
+    # ---- Text Embedding Encoder (REQUIRED) ----
+    # Recommended: Qwen3-Embedding (open-source SOTA, 2025)
+    #   "Qwen/Qwen3-Embedding-0.6B"  fastest, 0.6B params
+    #   "Qwen/Qwen3-Embedding-4B"    balanced, 4B params
+    #   "Qwen/Qwen3-Embedding"       highest quality, 8B params
+    # Also works with any HuggingFace text embedding model.
+    "llm_name":      "Qwen/Qwen3-Embedding-0.6B",
 
     # ---- Device for loading frozen encoders ----
     "device":        "cuda",   # "cuda" or "cpu"

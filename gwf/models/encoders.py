@@ -305,38 +305,87 @@ class TabPFNEncoder(nn.Module):
 
 
 # =============================================================================
-# Channel 6: LLM — world knowledge encoder  [OPTIONAL but recommended]
+# Channel 6: Text Embedding Encoder  [OPTIONAL but recommended]
 # =============================================================================
+
+def _last_token_pool(
+    last_hidden_states: torch.Tensor,   # (B, T, H)
+    attention_mask:     torch.Tensor,   # (B, T)
+) -> torch.Tensor:
+    """
+    Last-token pooling for decoder-based embedding models (e.g. Qwen3-Embedding).
+    Picks the hidden state at the position of the last non-padding token.
+    """
+    # Find the last real token for each sequence
+    seq_lens = attention_mask.sum(dim=1) - 1          # (B,)
+    B        = last_hidden_states.shape[0]
+    idx      = torch.arange(B, device=last_hidden_states.device)
+    return last_hidden_states[idx, seq_lens]           # (B, H)
+
+
+def _mean_pool(
+    last_hidden_states: torch.Tensor,   # (B, T, H)
+    attention_mask:     torch.Tensor,   # (B, T)
+) -> torch.Tensor:
+    """
+    Attention-mask-weighted mean pooling for encoder-based models.
+    """
+    mask_exp = attention_mask.unsqueeze(-1).float()    # (B, T, 1)
+    summed   = (last_hidden_states * mask_exp).sum(1)  # (B, H)
+    count    = mask_exp.sum(1).clamp(min=1e-9)         # (B, 1)
+    return summed / count                              # (B, H)
+
 
 class LLMEncoder(nn.Module):
     """
-    Encodes the dataset/task description prompt using a frozen LLM.
-    Returns a single vector (1, 1024) that is broadcast to (N, 1024).
+    Encodes the dataset/task description prompt using a frozen text
+    embedding model.  Returns a single vector (1, OUT_DIM=1024) that is
+    broadcast to all N points.
 
-    Supported models:
-      - "Qwen/Qwen2.5-7B"   (recommended)
-      - "meta-llama/Llama-3.1-8B-Instruct"
-      - Any HuggingFace text model
+    Recommended: Qwen3-Embedding (open-source SOTA as of 2025).
+    - "Qwen/Qwen3-Embedding"       8B params, 4096-dim  (highest quality)
+    - "Qwen/Qwen3-Embedding-4B"    4B params, 2560-dim
+    - "Qwen/Qwen3-Embedding-0.6B"  0.6B params, 1024-dim (fastest)
 
-    The prompt is encoded ONCE per dataset and cached. Subsequent calls
-    with the same prompt_text reuse the cached vector.
+    Qwen3-Embedding is decoder-based → uses LAST-TOKEN pooling.
+    Other encoder-based models (e.g. BGE, E5) → uses MEAN pooling.
+    The class auto-detects which to use from the model architecture.
 
-    If transformers is not installed or the model is not available,
-    returns zeros with a warning.
+    For Qwen3-Embedding the prompt is formatted with an instruction prefix:
+        "Instruct: <task>\\nQuery: <prompt_text>"
+    which improves embedding quality on task-specific retrieval.
+
+    The encoded vector is cached per prompt string (the LLM runs ONCE per
+    dataset, not once per batch).
+
+    If transformers is not installed or the model cannot be loaded,
+    returns zero tensors with a warning — other channels still work.
     """
 
-    OUT_DIM = 1024
+    OUT_DIM = 1024   # output after projection; bridges then project to d=512
 
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-7B", device: str = "cpu"):
+    # Instruction prefix used with Qwen3-Embedding (and compatible models)
+    _INSTRUCTION = (
+        "Instruct: Retrieve a semantically relevant representation of this "
+        "spatial dataset description for geographic regression.\nQuery: "
+    )
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        device:     str = "cpu",
+    ):
         super().__init__()
-        self.device_str = device
-        self._available = False
+        self.device_str  = device
+        self.model_name  = model_name
+        self._available  = False
         self._cache: dict[str, torch.Tensor] = {}
+        self._use_last_token = False   # set True for decoder-based models
 
         try:
             from transformers import AutoTokenizer, AutoModel  # type: ignore
 
-            logger.info(f"Loading LLM: {model_name} (this may take a while)...")
+            logger.info(f"Loading text encoder: {model_name} ...")
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_name, trust_remote_code=True
             )
@@ -347,27 +396,40 @@ class LLMEncoder(nn.Module):
             ).to(device)
             freeze(self.lm)
 
-            # Get actual hidden dim; project to OUT_DIM if needed
+            # Auto-detect decoder-based model (causal LM / Qwen3-Embedding)
+            arch = getattr(self.lm.config, "architectures", [])
+            model_lower = model_name.lower()
+            is_decoder = (
+                any("causal" in a.lower() or "decoder" in a.lower()
+                    for a in (arch or []))
+                or "qwen" in model_lower
+            )
+            self._use_last_token = is_decoder
+            pool_mode = "last-token" if is_decoder else "mean"
+            logger.info(f"  pooling mode: {pool_mode}")
+
+            # Trainable projection: hidden_dim → OUT_DIM
             hidden_dim = self.lm.config.hidden_size
             if hidden_dim != self.OUT_DIM:
-                # This is a trainable projection — placed here for convenience
                 self.proj = nn.Linear(hidden_dim, self.OUT_DIM, bias=False)
             else:
                 self.proj = nn.Identity()
 
             self._available = True
-            logger.info(f"LLM ({model_name}) loaded ✓")
+            logger.info(f"Text encoder ({model_name}) loaded ✓  "
+                        f"hidden={hidden_dim} → out={self.OUT_DIM}")
+
         except Exception as e:
-            logger.warning(f"LLM unavailable ({e}). Using zero task embeddings.")
+            logger.warning(f"Text encoder unavailable ({e}). Using zero embeddings.")
             self.tokenizer = None
-            self.lm = None
-            self.proj = None
+            self.lm        = None
+            self.proj      = None
 
     @torch.no_grad()
     def encode_prompt(self, prompt_text: str, device: torch.device) -> torch.Tensor:
         """
         Encode prompt_text → (1, OUT_DIM).
-        Result is cached by prompt string.
+        Result is cached — subsequent calls with the same string are free.
         """
         if prompt_text in self._cache:
             return self._cache[prompt_text].to(device)
@@ -377,18 +439,31 @@ class LLMEncoder(nn.Module):
             self._cache[prompt_text] = result
             return result
 
+        # For Qwen3-Embedding, prepend the instruction prefix
+        if self._use_last_token:
+            text = self._INSTRUCTION + prompt_text
+        else:
+            text = prompt_text
+
         inputs = self.tokenizer(
-            prompt_text,
+            text,
             return_tensors="pt",
             truncation=True,
             max_length=512,
+            padding=True,
         ).to(self.device_str)
 
         outputs = self.lm(**inputs, output_hidden_states=False)
-        # Mean pool over token dimension
-        token_embs = outputs.last_hidden_state  # (1, T, H)
-        c = token_embs.mean(dim=1)              # (1, H)
-        c = self.proj(c.float())                # (1, OUT_DIM)
+        hidden  = outputs.last_hidden_state   # (1, T, H)
+        attn    = inputs["attention_mask"]    # (1, T)
+
+        # Pool: last-token for decoder models, mean for encoder models
+        if self._use_last_token:
+            c = _last_token_pool(hidden, attn)    # (1, H)
+        else:
+            c = _mean_pool(hidden, attn)          # (1, H)
+
+        c = self.proj(c.float())               # (1, OUT_DIM)
         c = F.normalize(c, dim=-1)
 
         result = c.to(device).detach()
