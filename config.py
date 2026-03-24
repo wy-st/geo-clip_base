@@ -79,7 +79,7 @@ ENCODERS = {
     "llm_name":      "Qwen/Qwen3-Embedding-0.6B",
 
     # ---- Device for loading frozen encoders ----
-    "device":        "cuda",   # "cuda" or "cpu"
+    "device":        "cpu",   # "cuda" or "cpu"
 }
 
 # =============================================================================
@@ -112,7 +112,7 @@ LOSS = {
 # TRAINING
 # =============================================================================
 TRAINING = {
-    "device":       "cuda",   # "cuda" or "cpu"
+    "device":       "cpu",   # "cuda" or "cpu"
 
     # Batch size: for small datasets (N<10k) try full-batch (set to N).
     # For large datasets use 512-1024.
@@ -125,12 +125,12 @@ TRAINING = {
 
     # ---- Phase 2: Joint training (main phase) ----
     # Trains all trainable modules end-to-end.
-    "phase2_epochs": 100,
+    "phase2_epochs": 13,
     "phase2_lr":     5e-4,
 
     # ---- Phase 3: Task fine-tuning (optional) ----
     # Trains only FiLM + OutputHead. Use for transfer learning.
-    "phase3_epochs":  10,
+    "phase3_epochs":  2,
     "phase3_lr":      1e-4,
 
     # ---- Shared ----

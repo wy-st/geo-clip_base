@@ -224,6 +224,18 @@ def main():
     tot = sum(p.numel() for p in model.parameters())
     logger.info(f"Total params: {tot:,}")
 
+    # ── TabPFN context fit (once on full training set) ──────────────────────
+    # TabPFN in-context learning works best when fitted on the full training
+    # set rather than lazily on the first mini-batch.
+    if model.encoder_bank.tabpfn._available:
+        train_subset = train_loader.dataset          # torch Subset
+        train_idx    = train_subset.indices
+        X_train_full = dataset.X_tab[train_idx]
+        y_train_full = dataset.y[train_idx]
+        logger.info("Fitting TabPFN on full training set ...")
+        model.encoder_bank.tabpfn.fit_context(X_train_full, y_train_full)
+        logger.info(f"TabPFN context fitted: N={len(train_idx)}")
+
     # ── Loss ───────────────────────────────────────────────────────────────
     loss_fn = GWFLoss(
         cfg=cfg_loss,
