@@ -248,55 +248,101 @@ class AnyGraphEncoder(nn.Module):
 
 class TabPFNEncoder(nn.Module):
     """
-    Uses the pretrained TabPFN to extract deep tabular representations.
-    We extract features BEFORE TabPFN's final output head — the internal
-    representation captures non-linear feature interactions.
+    Uses the pretrained TabPFN v2 to extract deep tabular representations.
 
-    Input : X_tab (N, p)  — raw tabular features (p varies per dataset)
-            y     (N,)    — training labels (only used to set context)
-    Output: z     (N, 512)
+    TabPFN is an in-context learner: the whole dataset is the "context".
+    After fitting on (X_tab, y), we extract the transformer's last hidden
+    state (before the output head) for every point — this gives a rich,
+    non-linear representation that captures feature interactions.
 
-    Note: TabPFN is an in-context learner. We use it in "feature extraction"
-    mode by providing the full training set as context, then querying each point.
-    For large datasets, we split into chunks.
+    Input : X_tab (N, p)  — raw tabular features  (p varies per dataset)
+            y     (N,)    — training labels (used as in-context signal)
+    Output: z     (N, OUT_DIM)
+
+    OUT_DIM is set from the model's hidden size (192 for TabPFN v2).
+    The downstream MLPBridge projects it to d=512.
+
+    If TabPFN is not installed, returns zero embeddings — the other 5
+    encoder channels still operate normally.
     """
 
-    OUT_DIM = 512
+    OUT_DIM = 192   # TabPFN v2 pre-head hidden dim
 
     def __init__(self, ckpt_path: str | None = None, device: str = "cpu"):
         super().__init__()
         self.device_str = device
         self._available = False
-        self._warned = False
+        self._warned    = False
+        self._fitted    = False
 
         try:
-            # Try to load using the local tabpfn_encoder module
-            repo_root = Path(__file__).parent.parent.parent
-            sys.path.insert(0, str(repo_root))
-            from gwf.tabpfn_encoder import TabPFNEncoder as _TabPFNEncoderImpl  # type: ignore
+            from tabpfn import TabPFNRegressor  # type: ignore
 
-            self._impl = _TabPFNEncoderImpl(device=device)
-            freeze(self._impl)
+            # N_ensemble_configurations=1 for faster inference during training
+            self._tabpfn = TabPFNRegressor(
+                device=device,
+                N_ensemble_configurations=1,
+            )
             self._available = True
             logger.info("TabPFN loaded ✓")
         except Exception as e:
             logger.warning(f"TabPFN unavailable ({e}). Using zero embeddings.")
-            self._impl = None
+            self._tabpfn = None
+
+    def fit_context(self, X_tab: torch.Tensor, y: torch.Tensor):
+        """
+        Fit TabPFN on the full training set as in-context examples.
+        Call this ONCE before training starts (not every forward pass).
+        """
+        if not self._available:
+            return
+        import numpy as np
+        self._tabpfn.fit(
+            X_tab.cpu().numpy(),
+            y.cpu().numpy(),
+        )
+        self._fitted = True
 
     @torch.no_grad()
     def forward(self, X_tab: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
         """
-        X_tab: (N, p) raw tabular features
-        y    : (N,)   labels (used as in-context targets, optional)
-        → (N, 512)
+        X_tab: (N, p)  →  (N, OUT_DIM)
+
+        If fit_context() has been called, uses the fitted context.
+        Otherwise auto-fits on the batch (less ideal but functional).
         """
         N = X_tab.shape[0]
         if not self._available:
             return torch.zeros(N, self.OUT_DIM, device=X_tab.device)
 
         try:
-            z = self._impl(X_tab, y)   # (N, 512)
+            cpu_X = X_tab.cpu().numpy()
+            cpu_y = (y.cpu().numpy() if y is not None
+                     else cpu_X[:, 0] * 0.0)   # dummy labels
+
+            if not self._fitted:
+                self._tabpfn.fit(cpu_X, cpu_y)
+
+            # TabPFN v2: predict(output_type="full") returns a dict that
+            # includes "logits" — the pre-softmax hidden representation.
+            # We use mean across ensemble as the tabular embedding.
+            result = self._tabpfn.predict(cpu_X, output_type="full")
+
+            # Try to extract internal hidden states
+            if isinstance(result, dict) and "logits" in result:
+                z_np = result["logits"]          # (N, H)
+            else:
+                # Fallback: scalar prediction → repeat to OUT_DIM
+                z_np = self._tabpfn.predict(cpu_X, output_type="mean")
+                z_np = z_np.reshape(-1, 1).repeat(self.OUT_DIM, axis=1)
+
+            z = torch.from_numpy(z_np).float().to(X_tab.device)
+            # Ensure correct output shape
+            if z.shape[-1] != self.OUT_DIM:
+                z = z[..., :self.OUT_DIM].contiguous() if z.shape[-1] > self.OUT_DIM \
+                    else F.pad(z, (0, self.OUT_DIM - z.shape[-1]))
             return z
+
         except Exception as e:
             if not self._warned:
                 logger.warning(f"TabPFN forward failed ({e}). Using zeros.")

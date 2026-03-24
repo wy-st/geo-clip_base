@@ -81,12 +81,13 @@ class AllMLPBridges(nn.Module):
     """
 
     # Native output dimensions of each frozen encoder
+    # tabfpn: 192 = TabPFN v2 pre-head hidden dim
     CHANNEL_DIMS = {
         "satclip":  512,
         "geoclip":  512,
         "skysense": 768,
         "anygraph": 256,
-        "tabfpn":   512,
+        "tabfpn":   192,
         "llm":      1024,
     }
 
