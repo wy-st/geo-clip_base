@@ -92,7 +92,9 @@ class GWF(nn.Module):
         self.encoder_bank = FrozenEncoderBank(cfg)
 
         # ---- Module 2: MLP Bridges (trainable) ----
-        self.bridges = AllMLPBridges(d=d)
+        # channel_dims comes from the bank so bridges get the exact native dims
+        # (especially important for LLM whose hidden_size varies by variant)
+        self.bridges = AllMLPBridges(channel_dims=self.encoder_bank.out_dims, d=d)
 
         # ---- Module 3: Cross-Channel Fusion (trainable) ----
         self.fusion = CrossChannelFusion(d=d)

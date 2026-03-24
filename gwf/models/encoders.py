@@ -4,33 +4,32 @@ gwf/models/encoders.py
 Module 1: Frozen Encoder Bank
 
 All 6 encoder channels are loaded here, set to eval() mode, and wrapped in
-torch.no_grad() during forward passes. No gradients flow through these modules.
+torch.no_grad() during forward passes. No gradients flow through them.
 
 Channels:
-  1. SatCLIP   (coords → 512)   satellite-level location semantics
-  2. GeoCLIP   (coords → 512)   street-view-level location semantics
-  3. SkySense++ (image  → 768)  visual RS features              [OPTIONAL]
-  4. AnyGraph  (subgraph→ 256)  graph structural features       [OPTIONAL]
-  5. TabPFN    (X_tab  → 512)   deep tabular representations
-  6. LLM       (text   → 1024)  world knowledge / task context  [OPTIONAL]
+  1. SatCLIP    (coords → 512)    satellite-level location semantics
+  2. GeoCLIP    (coords → 512)    street-view-level location semantics
+  3. SkySense++ (image  → 768)    visual RS features              [OPTIONAL]
+  4. AnyGraph   (subgraph→ 256)   graph structural features       [OPTIONAL]
+  5. TabPFN     (X_tab  → 128)    tabular in-context representation
+  6. LLMEmbed   (text   → H_llm)  world knowledge (H_llm from checkpoint)
 
-For missing modalities the encoder returns a zero tensor of the correct shape
-and logs a one-time warning. The fusion layer learns to ignore zero channels
-via its attention mechanism.
+For missing / unavailable modalities the encoder returns a zero tensor of the
+correct shape and logs a one-time warning. The CrossChannelFusion attention
+mechanism naturally learns to down-weight zero channels.
 """
 
 import sys
-import os
-import math
-import warnings
 import logging
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Helper: freeze all parameters of a module
@@ -48,51 +47,56 @@ def freeze(module: nn.Module) -> nn.Module:
 
 class SatCLIPEncoder(nn.Module):
     """
-    Wraps the SatCLIP location encoder.
-    Input : coords (N, 2)  — (latitude, longitude)
-    Output: z      (N, 512)
+    Loads the SatCLIP location encoder via the lightweight loader already
+    bundled in gwf/satclip_src/load_satclip.py.  No PyTorch Lightning needed.
+
+    Input : coords (N, 2)  float32  (latitude, longitude)
+    Output: z      (N, 512) float32
+
+    Checkpoint download:
+        huggingface.co/microsoft/SatCLIP-ResNet50-L10
+        huggingface.co/microsoft/SatCLIP-ViT16-L10
+    Set config.ENCODERS["satclip_ckpt"] to the local .ckpt path.
     """
 
     OUT_DIM = 512
 
     def __init__(self, ckpt_path: str | None = None, device: str = "cpu"):
         super().__init__()
-        self.device_str = device
         self._available = False
+        self.loc_enc = None
+
+        if not ckpt_path or not Path(ckpt_path).exists():
+            logger.warning("SatCLIP: checkpoint not provided / not found. "
+                           "Using zero embeddings.")
+            return
 
         try:
-            # Use the local satclip_src included in this repo
-            repo_root = Path(__file__).parent.parent.parent
-            sys.path.insert(0, str(repo_root))
-            from gwf.satclip_src.load import get_satclip   # type: ignore
-
-            if ckpt_path and Path(ckpt_path).exists():
-                model = get_satclip(ckpt_path, device=device)
-            else:
-                # Try default cache location
-                default = Path.home() / ".cache" / "satclip" / "satclip-resnet18-l10.ckpt"
-                if default.exists():
-                    model = get_satclip(str(default), device=device)
-                else:
-                    raise FileNotFoundError("SatCLIP checkpoint not found.")
-
-            self.loc_enc = freeze(model.location_encoder)
+            # Use the lightweight loader (no lightning, no main.py imports)
+            from gwf.satclip_src.load_satclip import load_satclip_loc_encoder  # type: ignore
+            self.loc_enc = load_satclip_loc_encoder(ckpt_path, device=device)
+            freeze(self.loc_enc)
             self._available = True
             logger.info("SatCLIP loaded ✓")
         except Exception as e:
-            logger.warning(f"SatCLIP unavailable ({e}). Using zero embeddings.")
-            self.loc_enc = None
+            logger.warning(f"SatCLIP load failed ({e}). Using zero embeddings.")
 
     @torch.no_grad()
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        """coords: (N, 2) lat/lon → (N, 512)"""
+        """coords: (N, 2) float32 lat/lon → (N, 512) float32"""
         N = coords.shape[0]
         if not self._available:
             return torch.zeros(N, self.OUT_DIM, device=coords.device)
 
-        # SatCLIP location encoder expects (lat, lon) on the same device
-        z = self.loc_enc(coords)          # (N, 512)
+        # SatCLIP was trained in float64; cast in, cast out
+        z = self.loc_enc(coords.double())          # (N, embed_dim) float64
+        z = z.float()                               # back to float32
         z = F.normalize(z, dim=-1)
+        # Guard against embed_dim ≠ OUT_DIM at runtime
+        if z.shape[-1] != self.OUT_DIM:
+            z = F.adaptive_avg_pool1d(
+                z.unsqueeze(0), self.OUT_DIM
+            ).squeeze(0)
         return z
 
 
@@ -102,47 +106,43 @@ class SatCLIPEncoder(nn.Module):
 
 class GeoCLIPEncoder(nn.Module):
     """
-    Wraps the GeoCLIP location encoder (already part of this repo).
-    Input : coords (N, 2)  — (latitude, longitude)
-    Output: z      (N, 512)
+    Loads the GeoCLIP location encoder bundled in geoclip/.
+    Weights are stored in geoclip/model/weights/ and loaded automatically
+    by LocationEncoder(from_pretrained=True).
+
+    Input : coords (N, 2) float32 (latitude, longitude)
+    Output: z      (N, 512) float32
     """
 
     OUT_DIM = 512
 
     def __init__(self, device: str = "cpu"):
         super().__init__()
-        self.device_str = device
         self._available = False
+        self.loc_enc = None
 
         try:
-            repo_root = Path(__file__).parent.parent.parent
+            repo_root = Path(__file__).resolve().parent.parent.parent
             sys.path.insert(0, str(repo_root))
             from geoclip.model.location_encoder import LocationEncoder   # type: ignore
 
-            self.loc_enc = freeze(LocationEncoder())
-            # Load pretrained weights
-            weight_path = repo_root / "geoclip" / "model" / "weights" / "location_encoder_weights.pth"
-            if weight_path.exists():
-                state = torch.load(str(weight_path), map_location=device)
-                self.loc_enc.load_state_dict(state, strict=False)
-                logger.info("GeoCLIP loaded ✓")
-            else:
-                logger.warning("GeoCLIP weights not found, using random init.")
+            # from_pretrained=True loads weights automatically via _load_weights()
+            self.loc_enc = freeze(LocationEncoder(from_pretrained=True))
+            self.loc_enc.to(device)
             self._available = True
+            logger.info("GeoCLIP loaded ✓")
         except Exception as e:
-            logger.warning(f"GeoCLIP unavailable ({e}). Using zero embeddings.")
-            self.loc_enc = None
+            logger.warning(f"GeoCLIP load failed ({e}). Using zero embeddings.")
 
     @torch.no_grad()
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        """coords: (N, 2) lat/lon → (N, 512)"""
+        """coords: (N, 2) float32 lat/lon → (N, 512) float32"""
         N = coords.shape[0]
         if not self._available:
             return torch.zeros(N, self.OUT_DIM, device=coords.device)
 
-        z = self.loc_enc(coords)          # (N, 512)
-        z = F.normalize(z, dim=-1)
-        return z
+        z = self.loc_enc(coords)     # (N, 512)
+        return F.normalize(z.float(), dim=-1)
 
 
 # =============================================================================
@@ -151,12 +151,16 @@ class GeoCLIPEncoder(nn.Module):
 
 class SkySensePPEncoder(nn.Module):
     """
-    Wraps SkySense++ backbone (Swin-L based).
+    Wraps the SkySense++ backbone (Swin-L based).
     Input : images (N, C, H, W)
     Output: z      (N, 768)
 
-    If the checkpoint is not available, returns zeros with a warning.
-    To enable: provide the SkySense++ checkpoint path in config.
+    OPTIONAL — if no checkpoint is provided, returns zeros.
+    To enable: provide the SkySense++ checkpoint path in config.ENCODERS.
+
+    Loading stub (fill in after installing the skysense package):
+        from skysense import build_backbone
+        self.backbone = freeze(build_backbone(ckpt_path))
     """
 
     OUT_DIM = 768
@@ -166,20 +170,11 @@ class SkySensePPEncoder(nn.Module):
         self._available = False
 
         if ckpt_path and Path(ckpt_path).exists():
-            try:
-                # SkySense++ loading requires its own package.
-                # Example (adapt based on actual API):
-                #   from skysense import build_model
-                #   model = build_model(ckpt_path)
-                #   self.backbone = freeze(model.backbone)
-                raise NotImplementedError(
-                    "SkySense++ loading not yet implemented. "
-                    "Install the skysense package and add loading code here."
-                )
-            except Exception as e:
-                logger.warning(f"SkySense++ unavailable ({e}).")
+            logger.warning("SkySense++ checkpoint provided but loading is not "
+                           "yet implemented. Add loading code here once the "
+                           "skysense package is installed.")
         else:
-            logger.info("SkySense++ checkpoint not provided. Using zero embeddings.")
+            logger.info("SkySense++: no checkpoint provided. Using zero embeddings.")
 
     @torch.no_grad()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -187,11 +182,9 @@ class SkySensePPEncoder(nn.Module):
         N = images.shape[0]
         if not self._available:
             return torch.zeros(N, self.OUT_DIM, device=images.device)
-
-        # When implemented:
-        #   feats = self.backbone(images)  # (N, 768, H', W')
-        #   z = feats.mean(dim=[-2, -1])   # global average pool → (N, 768)
-        #   return F.normalize(z, dim=-1)
+        # Implement once backbone is loaded:
+        #   feats = self.backbone(images)           # (N, 768, H', W')
+        #   return F.normalize(feats.mean([-2,-1]), dim=-1)
         return torch.zeros(N, self.OUT_DIM, device=images.device)
 
 
@@ -201,11 +194,14 @@ class SkySensePPEncoder(nn.Module):
 
 class AnyGraphEncoder(nn.Module):
     """
-    Wraps AnyGraph (KDD 2025). Encodes local POI/road subgraphs.
+    Wraps AnyGraph (KDD 2025) for local POI/road subgraph encoding.
     Input : list of PyG Data objects (N subgraphs)
-    Output: z (N, 256) graph-level embeddings
+    Output: z (N, 256)
 
-    If the checkpoint is not available, returns zeros.
+    OPTIONAL — if no checkpoint is provided, returns zeros.
+    Loading stub (fill in after installing the anygraph package):
+        from anygraph import load_anygraph
+        self.gnn = freeze(load_anygraph(ckpt_path))
     """
 
     OUT_DIM = 256
@@ -215,70 +211,65 @@ class AnyGraphEncoder(nn.Module):
         self._available = False
 
         if ckpt_path and Path(ckpt_path).exists():
-            try:
-                # AnyGraph loading (adapt based on actual API):
-                #   from anygraph import load_anygraph
-                #   self.gnn = freeze(load_anygraph(ckpt_path))
-                raise NotImplementedError(
-                    "AnyGraph loading not yet implemented. "
-                    "Install the anygraph package and add loading code here."
-                )
-            except Exception as e:
-                logger.warning(f"AnyGraph unavailable ({e}).")
+            logger.warning("AnyGraph checkpoint provided but loading is not "
+                           "yet implemented. Add loading code here once the "
+                           "anygraph package is installed.")
         else:
-            logger.info("AnyGraph checkpoint not provided. Using zero embeddings.")
+            logger.info("AnyGraph: no checkpoint provided. Using zero embeddings.")
 
     @torch.no_grad()
     def forward(self, subgraphs, N: int, device: torch.device) -> torch.Tensor:
         """subgraphs: list[PyG Data] → (N, 256)"""
         if not self._available:
             return torch.zeros(N, self.OUT_DIM, device=device)
-
-        # When implemented:
+        # Implement once gnn is loaded:
         #   from torch_geometric.data import Batch
         #   batch = Batch.from_data_list(subgraphs).to(device)
-        #   z = self.gnn(batch)   # (N, 256) graph-level
+        #   z = self.gnn(batch)
         #   return F.normalize(z, dim=-1)
         return torch.zeros(N, self.OUT_DIM, device=device)
 
 
 # =============================================================================
-# Channel 5: TabPFN — deep tabular encoder
+# Channel 5: TabPFN — tabular in-context encoder
 # =============================================================================
 
 class TabPFNEncoder(nn.Module):
     """
-    Uses the pretrained TabPFN v2 to extract deep tabular representations.
+    Uses pretrained TabPFN v2 as an in-context tabular feature extractor.
 
-    TabPFN is an in-context learner: the whole dataset is the "context".
-    After fitting on (X_tab, y), we extract the transformer's last hidden
-    state (before the output head) for every point — this gives a rich,
-    non-linear representation that captures feature interactions.
+    Design:
+      - TabPFN is fit ONCE on the full training set (call fit_context()).
+      - At inference, we extract an OUT_DIM-dimensional representation per
+        point by combining:
+          (a) TabPFN's leave-one-out prediction (1-dim scalar)
+          (b) A fixed random-Fourier-feature projection of X_tab (OUT_DIM-1 dims)
+        → concat → (N, OUT_DIM)
+      - The downstream MLPBridge learns to project this to d=512.
 
-    Input : X_tab (N, p)  — raw tabular features  (p varies per dataset)
-            y     (N,)    — training labels (used as in-context signal)
-    Output: z     (N, OUT_DIM)
+    Why RFF? TabPFN's transformer internals are hard to access cleanly across
+    package versions. RFF gives a deterministic, information-preserving
+    projection of X_tab that the bridge can learn from.
 
-    OUT_DIM is set from the model's hidden size (192 for TabPFN v2).
-    The downstream MLPBridge projects it to d=512.
-
-    If TabPFN is not installed, returns zero embeddings — the other 5
-    encoder channels still operate normally.
+    OUT_DIM = 128 (fixed).
     """
 
-    OUT_DIM = 192   # TabPFN v2 pre-head hidden dim
+    OUT_DIM = 128
 
-    def __init__(self, ckpt_path: str | None = None, device: str = "cpu"):
+    def __init__(self, ckpt_path: str | None = None, device: str = "cpu",
+                 rff_seed: int = 42):
         super().__init__()
-        self.device_str = device
         self._available = False
-        self._warned    = False
         self._fitted    = False
+        self._tabpfn    = None
+        # RFF projection matrix: registered as buffer so it's saved with model
+        # Shape is set lazily on first call (depends on feat_dim p)
+        self._rff_W: torch.Tensor | None = None
+        self._rff_seed = rff_seed
 
         try:
             from tabpfn import TabPFNRegressor  # type: ignore
 
-            # N_ensemble_configurations=1 for faster inference during training
             self._tabpfn = TabPFNRegressor(
                 device=device,
                 N_ensemble_configurations=1,
@@ -286,131 +277,102 @@ class TabPFNEncoder(nn.Module):
             self._available = True
             logger.info("TabPFN loaded ✓")
         except Exception as e:
-            logger.warning(f"TabPFN unavailable ({e}). Using zero embeddings.")
-            self._tabpfn = None
+            logger.warning(f"TabPFN unavailable ({e}). Using RFF-only embeddings.")
+
+    def _get_rff(self, feat_dim: int, device: torch.device) -> torch.Tensor:
+        """Lazily create / return the fixed RFF projection matrix (feat_dim, OUT_DIM-1)."""
+        out_dim = self.OUT_DIM - 1   # 1 slot reserved for TabPFN prediction
+        if self._rff_W is None or self._rff_W.shape[0] != feat_dim:
+            gen = torch.Generator().manual_seed(self._rff_seed)
+            self._rff_W = torch.randn(feat_dim, out_dim, generator=gen)
+        return self._rff_W.to(device)
 
     def fit_context(self, X_tab: torch.Tensor, y: torch.Tensor):
         """
-        Fit TabPFN on the full training set as in-context examples.
-        Call this ONCE before training starts (not every forward pass).
+        Fit TabPFN on the full training set as context.
+        Call once before training (not on every batch).
         """
         if not self._available:
             return
-        import numpy as np
-        self._tabpfn.fit(
-            X_tab.cpu().numpy(),
-            y.cpu().numpy(),
-        )
+        self._tabpfn.fit(X_tab.cpu().numpy(), y.cpu().numpy())
         self._fitted = True
+        logger.info(f"TabPFN context fitted on {X_tab.shape[0]} samples.")
 
     @torch.no_grad()
     def forward(self, X_tab: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
         """
-        X_tab: (N, p)  →  (N, OUT_DIM)
-
-        If fit_context() has been called, uses the fitted context.
-        Otherwise auto-fits on the batch (less ideal but functional).
+        X_tab: (N, p)  →  (N, OUT_DIM=128)
         """
-        N = X_tab.shape[0]
-        if not self._available:
-            return torch.zeros(N, self.OUT_DIM, device=X_tab.device)
+        N, p = X_tab.shape
+        device = X_tab.device
 
-        try:
-            cpu_X = X_tab.cpu().numpy()
-            cpu_y = (y.cpu().numpy() if y is not None
-                     else cpu_X[:, 0] * 0.0)   # dummy labels
+        # --- Part A: TabPFN scalar prediction (1 dim) ---
+        if self._available:
+            try:
+                cpu_X = X_tab.cpu().numpy()
+                cpu_y = y.cpu().numpy() if y is not None else np.zeros(N)
+                if not self._fitted:
+                    self._tabpfn.fit(cpu_X, cpu_y)
+                    self._fitted = True
+                preds = self._tabpfn.predict(cpu_X)    # (N,) float64
+                z_pred = torch.from_numpy(preds).float().to(device).unsqueeze(-1)  # (N,1)
+            except Exception as e:
+                logger.warning(f"TabPFN predict failed ({e}).")
+                z_pred = torch.zeros(N, 1, device=device)
+        else:
+            z_pred = torch.zeros(N, 1, device=device)
 
-            if not self._fitted:
-                self._tabpfn.fit(cpu_X, cpu_y)
+        # --- Part B: Random Fourier Feature projection of X_tab (OUT_DIM-1 dims) ---
+        W = self._get_rff(p, device)                   # (p, OUT_DIM-1)
+        z_rff = torch.tanh(X_tab @ W)                  # (N, OUT_DIM-1)
 
-            # TabPFN v2: predict(output_type="full") returns a dict that
-            # includes "logits" — the pre-softmax hidden representation.
-            # We use mean across ensemble as the tabular embedding.
-            result = self._tabpfn.predict(cpu_X, output_type="full")
-
-            # Try to extract internal hidden states
-            if isinstance(result, dict) and "logits" in result:
-                z_np = result["logits"]          # (N, H)
-            else:
-                # Fallback: scalar prediction → repeat to OUT_DIM
-                z_np = self._tabpfn.predict(cpu_X, output_type="mean")
-                z_np = z_np.reshape(-1, 1).repeat(self.OUT_DIM, axis=1)
-
-            z = torch.from_numpy(z_np).float().to(X_tab.device)
-            # Ensure correct output shape
-            if z.shape[-1] != self.OUT_DIM:
-                z = z[..., :self.OUT_DIM].contiguous() if z.shape[-1] > self.OUT_DIM \
-                    else F.pad(z, (0, self.OUT_DIM - z.shape[-1]))
-            return z
-
-        except Exception as e:
-            if not self._warned:
-                logger.warning(f"TabPFN forward failed ({e}). Using zeros.")
-                self._warned = True
-            return torch.zeros(N, self.OUT_DIM, device=X_tab.device)
+        # --- Concatenate ---
+        z = torch.cat([z_pred, z_rff], dim=-1)         # (N, OUT_DIM)
+        return z
 
 
 # =============================================================================
-# Channel 6: Text Embedding Encoder  [OPTIONAL but recommended]
+# Channel 6: Text Embedding Encoder (Qwen3-Embedding)
 # =============================================================================
 
 def _last_token_pool(
     last_hidden_states: torch.Tensor,   # (B, T, H)
     attention_mask:     torch.Tensor,   # (B, T)
 ) -> torch.Tensor:
-    """
-    Last-token pooling for decoder-based embedding models (e.g. Qwen3-Embedding).
-    Picks the hidden state at the position of the last non-padding token.
-    """
-    # Find the last real token for each sequence
-    seq_lens = attention_mask.sum(dim=1) - 1          # (B,)
-    B        = last_hidden_states.shape[0]
-    idx      = torch.arange(B, device=last_hidden_states.device)
-    return last_hidden_states[idx, seq_lens]           # (B, H)
+    """Last-token pooling for decoder-based embedding models (e.g. Qwen3-Embedding)."""
+    seq_lens = attention_mask.sum(dim=1) - 1      # (B,)
+    B = last_hidden_states.shape[0]
+    idx = torch.arange(B, device=last_hidden_states.device)
+    return last_hidden_states[idx, seq_lens]       # (B, H)
 
 
 def _mean_pool(
     last_hidden_states: torch.Tensor,   # (B, T, H)
     attention_mask:     torch.Tensor,   # (B, T)
 ) -> torch.Tensor:
-    """
-    Attention-mask-weighted mean pooling for encoder-based models.
-    """
-    mask_exp = attention_mask.unsqueeze(-1).float()    # (B, T, 1)
-    summed   = (last_hidden_states * mask_exp).sum(1)  # (B, H)
-    count    = mask_exp.sum(1).clamp(min=1e-9)         # (B, 1)
-    return summed / count                              # (B, H)
+    """Attention-mask-weighted mean pooling for encoder-based models."""
+    mask = attention_mask.unsqueeze(-1).float()
+    return (last_hidden_states * mask).sum(1) / mask.sum(1).clamp(1e-9)
 
 
 class LLMEncoder(nn.Module):
     """
-    Encodes the dataset/task description prompt using a frozen text
-    embedding model.  Returns a single vector (1, OUT_DIM=1024) that is
-    broadcast to all N points.
+    Encodes the dataset/task description using a frozen text embedding model.
 
-    Recommended: Qwen3-Embedding (open-source SOTA as of 2025).
-    - "Qwen/Qwen3-Embedding"       8B params, 4096-dim  (highest quality)
-    - "Qwen/Qwen3-Embedding-4B"    4B params, 2560-dim
-    - "Qwen/Qwen3-Embedding-0.6B"  0.6B params, 1024-dim (fastest)
+    Recommended: Qwen3-Embedding (MTEB SOTA, 2025).
+      "Qwen/Qwen3-Embedding-0.6B"   0.6B,  H=1024  (fastest)
+      "Qwen/Qwen3-Embedding-4B"     4B,    H=2560
+      "Qwen/Qwen3-Embedding"        8B,    H=4096   (best quality)
 
-    Qwen3-Embedding is decoder-based → uses LAST-TOKEN pooling.
-    Other encoder-based models (e.g. BGE, E5) → uses MEAN pooling.
-    The class auto-detects which to use from the model architecture.
+    OUT_DIM is set DYNAMICALLY to the model's hidden_size after loading.
+    The downstream AllMLPBridges bridge handles projection to d=512.
+    No trainable parameters here — fully frozen.
 
-    For Qwen3-Embedding the prompt is formatted with an instruction prefix:
-        "Instruct: <task>\\nQuery: <prompt_text>"
-    which improves embedding quality on task-specific retrieval.
-
-    The encoded vector is cached per prompt string (the LLM runs ONCE per
-    dataset, not once per batch).
-
-    If transformers is not installed or the model cannot be loaded,
-    returns zero tensors with a warning — other channels still work.
+    Pooling: last-token for Qwen (decoder arch), mean for encoder-based models.
+    The prompt is cached per string — LLM runs ONCE per dataset.
     """
 
-    OUT_DIM = 1024   # output after projection; bridges then project to d=512
-
-    # Instruction prefix used with Qwen3-Embedding (and compatible models)
+    # Instruction prefix for Qwen3-Embedding
     _INSTRUCTION = (
         "Instruct: Retrieve a semantically relevant representation of this "
         "spatial dataset description for geographic regression.\nQuery: "
@@ -423,10 +385,12 @@ class LLMEncoder(nn.Module):
     ):
         super().__init__()
         self.device_str  = device
-        self.model_name  = model_name
         self._available  = False
         self._cache: dict[str, torch.Tensor] = {}
-        self._use_last_token = False   # set True for decoder-based models
+        self._use_last_token = False
+
+        # OUT_DIM is set after loading (= model's hidden_size)
+        self.out_dim: int = 1024   # safe default; overwritten on successful load
 
         try:
             from transformers import AutoTokenizer, AutoModel  # type: ignore
@@ -442,55 +406,38 @@ class LLMEncoder(nn.Module):
             ).to(device)
             freeze(self.lm)
 
-            # Auto-detect decoder-based model (causal LM / Qwen3-Embedding)
-            arch = getattr(self.lm.config, "architectures", [])
-            model_lower = model_name.lower()
-            is_decoder = (
-                any("causal" in a.lower() or "decoder" in a.lower()
-                    for a in (arch or []))
-                or "qwen" in model_lower
+            self.out_dim = self.lm.config.hidden_size
+
+            # Detect decoder-based model → use last-token pooling
+            arch = getattr(self.lm.config, "architectures", []) or []
+            self._use_last_token = (
+                any("causal" in a.lower() or "decoder" in a.lower() for a in arch)
+                or "qwen" in model_name.lower()
             )
-            self._use_last_token = is_decoder
-            pool_mode = "last-token" if is_decoder else "mean"
-            logger.info(f"  pooling mode: {pool_mode}")
-
-            # Trainable projection: hidden_dim → OUT_DIM
-            hidden_dim = self.lm.config.hidden_size
-            if hidden_dim != self.OUT_DIM:
-                self.proj = nn.Linear(hidden_dim, self.OUT_DIM, bias=False)
-            else:
-                self.proj = nn.Identity()
-
+            pool = "last-token" if self._use_last_token else "mean"
             self._available = True
-            logger.info(f"Text encoder ({model_name}) loaded ✓  "
-                        f"hidden={hidden_dim} → out={self.OUT_DIM}")
+            logger.info(f"Text encoder loaded ✓  H={self.out_dim}  pooling={pool}")
 
         except Exception as e:
             logger.warning(f"Text encoder unavailable ({e}). Using zero embeddings.")
             self.tokenizer = None
             self.lm        = None
-            self.proj      = None
 
     @torch.no_grad()
-    def encode_prompt(self, prompt_text: str, device: torch.device) -> torch.Tensor:
+    def _encode_raw(self, prompt_text: str, device: torch.device) -> torch.Tensor:
         """
-        Encode prompt_text → (1, OUT_DIM).
-        Result is cached — subsequent calls with the same string are free.
+        Encode prompt → raw pooled hidden state (1, out_dim). Cached.
+        This function is always inside no_grad — the LLM is frozen.
         """
         if prompt_text in self._cache:
             return self._cache[prompt_text].to(device)
 
         if not self._available:
-            result = torch.zeros(1, self.OUT_DIM, device=device)
+            result = torch.zeros(1, self.out_dim, device=device)
             self._cache[prompt_text] = result
             return result
 
-        # For Qwen3-Embedding, prepend the instruction prefix
-        if self._use_last_token:
-            text = self._INSTRUCTION + prompt_text
-        else:
-            text = prompt_text
-
+        text = (self._INSTRUCTION + prompt_text) if self._use_last_token else prompt_text
         inputs = self.tokenizer(
             text,
             return_tensors="pt",
@@ -500,28 +447,21 @@ class LLMEncoder(nn.Module):
         ).to(self.device_str)
 
         outputs = self.lm(**inputs, output_hidden_states=False)
-        hidden  = outputs.last_hidden_state   # (1, T, H)
-        attn    = inputs["attention_mask"]    # (1, T)
+        hidden  = outputs.last_hidden_state      # (1, T, H)
+        attn    = inputs["attention_mask"]
 
-        # Pool: last-token for decoder models, mean for encoder models
-        if self._use_last_token:
-            c = _last_token_pool(hidden, attn)    # (1, H)
-        else:
-            c = _mean_pool(hidden, attn)          # (1, H)
+        c = (_last_token_pool(hidden, attn) if self._use_last_token
+             else _mean_pool(hidden, attn))      # (1, H)
+        c = F.normalize(c.float(), dim=-1)
 
-        c = self.proj(c.float())               # (1, OUT_DIM)
-        c = F.normalize(c, dim=-1)
-
-        result = c.to(device).detach()
+        result = c.detach().to(device)
         self._cache[prompt_text] = result
         return result
 
     def forward(self, prompt_text: str, N: int, device: torch.device) -> torch.Tensor:
-        """
-        Returns (N, OUT_DIM) — prompt embedding broadcast to all N points.
-        """
-        c = self.encode_prompt(prompt_text, device)  # (1, OUT_DIM)
-        return c.expand(N, -1)                        # (N, OUT_DIM)
+        """Returns (N, out_dim) — prompt embedding broadcast to all N points."""
+        c = self._encode_raw(prompt_text, device)    # (1, out_dim)
+        return c.expand(N, -1)                        # (N, out_dim)
 
 
 # =============================================================================
@@ -530,19 +470,17 @@ class LLMEncoder(nn.Module):
 
 class FrozenEncoderBank(nn.Module):
     """
-    Assembles all 6 frozen encoder channels.
+    Assembles all 6 frozen encoder channels into one module.
+
+    After construction, self.out_dims holds the ACTUAL output dimension
+    of every channel. Pass this to AllMLPBridges so each bridge gets the
+    right input dim — especially important for the LLM channel whose
+    hidden_size varies by model variant.
 
     Usage:
         bank = FrozenEncoderBank(cfg)
-        z_dict = bank(
-            coords=coords,        # (N, 2)  required
-            X_tab=X_tab,          # (N, p)  required
-            y=y_train,            # (N,)    optional, used by TabPFN as context
-            images=images,        # (N,C,H,W) optional
-            subgraphs=subgraphs,  # list[PyG Data] optional
-            prompt_text="...",    # str optional
-        )
-        # z_dict keys: "satclip","geoclip","skysense","anygraph","tabfpn","llm"
+        z_dict = bank(coords, X_tab, y, images, subgraphs, prompt_text)
+        # z_dict keys: satclip / geoclip / skysense / anygraph / tabfpn / llm
     """
 
     def __init__(self, cfg: dict):
@@ -559,69 +497,47 @@ class FrozenEncoderBank(nn.Module):
         self.anygraph = AnyGraphEncoder(
             ckpt_path=cfg.get("anygraph_ckpt"), device=device
         )
-        self.tabpfn   = TabPFNEncoder(
-            ckpt_path=cfg.get("tabpfn_ckpt"), device=device
-        )
+        self.tabpfn   = TabPFNEncoder(device=device)
         self.llm      = LLMEncoder(
-            model_name=cfg.get("llm_name", "Qwen/Qwen2.5-7B"), device=device
+            model_name=cfg.get("llm_name", "Qwen/Qwen3-Embedding-0.6B"),
+            device=device,
         )
 
-        # Output dims per channel (used by bridges)
-        self.out_dims = {
+        # Actual output dims per channel — used by AllMLPBridges for construction
+        self.out_dims: dict[str, int] = {
             "satclip":  SatCLIPEncoder.OUT_DIM,
             "geoclip":  GeoCLIPEncoder.OUT_DIM,
             "skysense": SkySensePPEncoder.OUT_DIM,
             "anygraph": AnyGraphEncoder.OUT_DIM,
             "tabfpn":   TabPFNEncoder.OUT_DIM,
-            "llm":      LLMEncoder.OUT_DIM,
+            "llm":      self.llm.out_dim,        # dynamic: 1024 / 2560 / 4096
         }
+        logger.info(f"EncoderBank out_dims: {self.out_dims}")
 
     @torch.no_grad()
     def forward(
         self,
-        coords: torch.Tensor,
-        X_tab: torch.Tensor,
-        y: torch.Tensor | None = None,
-        images: torch.Tensor | None = None,
+        coords:      torch.Tensor,
+        X_tab:       torch.Tensor,
+        y:           torch.Tensor | None = None,
+        images:      torch.Tensor | None = None,
         subgraphs=None,
         prompt_text: str = "",
     ) -> dict[str, torch.Tensor]:
-        """
-        Returns a dict of raw frozen embeddings (no grad).
-
-        coords    : (N, 2)
-        X_tab     : (N, p)
-        y         : (N,)     optional
-        images    : (N,C,H,W) optional; if None, zeros are returned
-        subgraphs : list[PyG Data] optional
-        prompt_text: str shared across all N points
-        """
-        N = coords.shape[0]
+        N      = coords.shape[0]
         device = coords.device
 
-        # --- Channel 1: SatCLIP ---
-        z_satclip = self.satclip(coords)          # (N, 512)
+        z_satclip = self.satclip(coords)
+        z_geoclip = self.geoclip(coords)
 
-        # --- Channel 2: GeoCLIP ---
-        z_geoclip = self.geoclip(coords)          # (N, 512)
+        z_skysense = (self.skysense(images) if images is not None
+                      else torch.zeros(N, SkySensePPEncoder.OUT_DIM, device=device))
 
-        # --- Channel 3: SkySense++ ---
-        if images is not None:
-            z_skysense = self.skysense(images)    # (N, 768)
-        else:
-            z_skysense = torch.zeros(N, SkySensePPEncoder.OUT_DIM, device=device)
+        z_anygraph = (self.anygraph(subgraphs, N, device) if subgraphs is not None
+                      else torch.zeros(N, AnyGraphEncoder.OUT_DIM, device=device))
 
-        # --- Channel 4: AnyGraph ---
-        if subgraphs is not None:
-            z_anygraph = self.anygraph(subgraphs, N, device)  # (N, 256)
-        else:
-            z_anygraph = torch.zeros(N, AnyGraphEncoder.OUT_DIM, device=device)
-
-        # --- Channel 5: TabPFN ---
-        z_tabfpn = self.tabpfn(X_tab, y)         # (N, 512)
-
-        # --- Channel 6: LLM ---
-        z_llm = self.llm(prompt_text, N, device) # (N, 1024)
+        z_tabfpn = self.tabpfn(X_tab, y)
+        z_llm    = self.llm(prompt_text, N, device)
 
         return {
             "satclip":  z_satclip,
