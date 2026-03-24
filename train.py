@@ -1,206 +1,260 @@
 """
-GWF 训练脚本
+train.py
+========
+GWF training script.
 
-使用方法：
+Run with:
     python train.py
 
-所有参数在 config.py 里修改，不需要动这个文件。
+All hyperparameters are in config.py — edit that file, not this one.
+
+Three-phase training strategy:
+  Phase 1  Bridge warm-up   — trains only MLP bridges + CrossChannelFusion
+  Phase 2  Joint training   — trains all trainable modules end-to-end
+  Phase 3  Task fine-tuning — trains only FiLM + OutputHead (transfer learning)
 """
 
 import os
 import sys
-import numpy as np
+import time
+import logging
+from pathlib import Path
+
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# 确保项目根目录在 Python 路径里
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import DATA, MODEL, TRAINING
-from gwf.model import GWF
-from gwf.data  import get_dataloaders
+import config
+from gwf.models.gwf      import GWF
+from gwf.losses.gwf_loss  import GWFLoss
+from gwf.data.dataset     import load_gwf_dataset, get_dataloaders
+from gwf.data.prompts     import PROMPT_TEMPLATES
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("gwf.train")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Metrics
+# =============================================================================
 
-def precompute_embeddings(model, full_dataset, device, batch_size=256):
-    """
-    TabPFN 参数全部冻结，所以对固定的 k-NN 图，每个点的嵌入是常数。
-    训练前一次性算好，之后每个 epoch 直接查表，速度提升 10-50x。
-
-    full_dataset : SpatialRegressionDataset（random_split 之前的原始数据集）
-    """
-    from torch.utils.data import DataLoader as _DL
-
-    n = len(full_dataset)
-    D = model.ctx_enc.emb_dim
-    k = int(full_dataset.nbr_idx.shape[1])
-
-    z_query_all = torch.zeros(n, D,    dtype=torch.float32)
-    z_nbr_all   = torch.zeros(n, k, D, dtype=torch.float32)
-
-    loader = _DL(full_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-    model.ctx_enc.eval()
-
-    offset = 0
-    n_batches = len(loader)
-    with torch.no_grad():
-        for i, batch in enumerate(loader):
-            batch = {kk: vv.to(device) for kk, vv in batch.items()
-                     if isinstance(vv, torch.Tensor)}
-            z_q, z_n = model.ctx_enc(batch["x"], batch["nbr_x"], batch["nbr_y"])
-            idxs = batch["idx"]
-            z_query_all[idxs] = z_q.cpu().float()
-            z_nbr_all[idxs]   = z_n.cpu().float()
-            offset += z_q.shape[0]
-            print(f"\r  [{i+1}/{n_batches}] {offset}/{n} 点", end="", flush=True)
-
-    print(f"\r  完成，缓存 {n:,} 条嵌入 "
-          f"({(z_query_all.nbytes + z_nbr_all.nbytes) / 1e6:.0f} MB)  ")
-
-    full_dataset.z_query = z_query_all
-    full_dataset.z_nbr   = z_nbr_all
+def compute_metrics(y_pred: torch.Tensor, y_true: torch.Tensor) -> dict:
+    residuals = y_pred - y_true
+    rmse = residuals.pow(2).mean().sqrt().item()
+    mae  = residuals.abs().mean().item()
+    ss_res = residuals.pow(2).sum()
+    ss_tot = (y_true - y_true.mean()).pow(2).sum().clamp(min=1e-8)
+    r2 = (1.0 - ss_res / ss_tot).item()
+    return {"RMSE": rmse, "MAE": mae, "R2": r2}
 
 
-def evaluate(model, dataloader, device):
-    """在 dataloader 上计算 RMSE 和 R²。"""
+@torch.no_grad()
+def evaluate(model, loader, device, prompt: str) -> dict:
     model.eval()
-    y_preds, y_trues = [], []
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()
-                     if isinstance(v, torch.Tensor)}
-            y_hat, _ = model(batch)
-            y_preds.append(y_hat.cpu())
-            y_trues.append(batch["y"].cpu())
+    preds, trues = [], []
+    for batch in loader:
+        coords = batch["coords"].to(device)
+        X_tab  = batch["X_tab"].to(device)
+        y_true = batch["y"].to(device)
+        images = batch.get("image")
+        if images is not None:
+            images = images.to(device)
 
-    y_pred = torch.cat(y_preds)
-    y_true = torch.cat(y_trues)
+        y_pred, _ = model(
+            coords=coords, X_tab=X_tab,
+            images=images, prompt_text=prompt, deterministic=True,
+        )
+        preds.append(y_pred.squeeze(-1).cpu())
+        trues.append(y_true.cpu())
 
-    rmse = float(F.mse_loss(y_pred, y_true).sqrt())
-    ss_res = float(((y_pred - y_true) ** 2).sum())
-    ss_tot = float(((y_true - y_true.mean()) ** 2).sum())
-    r2 = 1.0 - ss_res / ss_tot
-    return rmse, r2
+    return compute_metrics(torch.cat(preds), torch.cat(trues))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Phase runner
+# =============================================================================
 
-def main():
-    device = TRAINING["device"]
-    seed   = DATA.get("seed", 42)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+def run_phase(
+    phase, model, train_loader, val_loader,
+    loss_fn, cfg_tr, prompt, device, best_r2, best_path,
+) -> float:
 
-    print("\n" + "=" * 60)
-    print("  GWF — Geographical Weights Foundation Model")
-    print("=" * 60)
+    # Phase-specific parameter freeze + LR
+    if phase == 1:
+        model.freeze_for_phase1()
+        lr, epochs = cfg_tr["phase1_lr"], cfg_tr["phase1_epochs"]
+    elif phase == 2:
+        model.freeze_for_phase2()
+        lr, epochs = cfg_tr["phase2_lr"], cfg_tr["phase2_epochs"]
+    else:
+        model.freeze_for_phase3()
+        lr, epochs = cfg_tr["phase3_lr"], cfg_tr["phase3_epochs"]
 
-    # ── 1. 加载数据 ────────────────────────────────────────────────────────
-    print("\n[1/4] 加载数据...")
-    train_dl, val_dl, feat_dim = get_dataloaders(
-        source       = DATA["source"],
-        k            = MODEL["k_neighbors"],
-        val_split    = DATA.get("val_split", 0.2),
-        batch_size   = TRAINING["batch_size"],
-        seed         = seed,
-        geojson_path = DATA.get("geojson_path"),
-        csv_path     = DATA.get("csv_path"),
-        lat_col      = DATA.get("lat_col", "lat"),
-        lon_col      = DATA.get("lon_col", "lon"),
-        target_col   = DATA.get("target_col", "price"),
-        feature_cols = DATA.get("feature_cols"),
+    if epochs <= 0:
+        logger.info(f"Phase {phase} skipped (epochs=0).")
+        return best_r2
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"\nPhase {phase} | {epochs} epochs | lr={lr:.1e} | "
+                f"trainable params={trainable:,}")
+
+    opt   = AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr, weight_decay=cfg_tr["weight_decay"],
     )
-    print(f"  训练集: {len(train_dl.dataset):,} 条  "
-          f"验证集: {len(val_dl.dataset):,} 条  "
-          f"特征数: {feat_dim}")
+    sched = CosineAnnealingLR(opt, T_max=max(epochs, 1))
 
-    # ── 2. 构建模型 ────────────────────────────────────────────────────────
-    print("\n[2/4] 构建模型...")
-    model = GWF(
-        feat_dim     = feat_dim,
-        loc_proj_dim = MODEL.get("loc_proj_dim", 64),
-        node_dim     = MODEL.get("node_dim", 128),
-        z_proj_dim   = MODEL.get("z_proj_dim", 32),
-        attn_dim     = MODEL.get("attn_dim", 64),
-        y_inject_dim = MODEL.get("y_inject_dim", 8),
-        tabpfn_path  = MODEL.get("tabpfn_path"),
-    ).to(device)
+    # Table header
+    print(f"\n{'Phase':^7} {'Epoch':^7} {'Train Loss':^14} "
+          f"{'Val RMSE':^11} {'Val R²':^9} {'Time':^8}")
+    print("-" * 60)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  可训练参数: {n_params:,}")
-
-    # ── 3a. 预计算 TabPFN 嵌入（只跑一次，之后每 epoch 直接查表）──────────
-    print("\n[3/4] 预计算 TabPFN 嵌入（只需等一次）...")
-    # train_dl.dataset 是 Subset，.dataset 才是原始 SpatialRegressionDataset
-    full_dataset = train_dl.dataset.dataset
-    precompute_embeddings(model, full_dataset, device,
-                          batch_size=TRAINING["batch_size"])
-
-    # ── 3b. 训练 ────────────────────────────────────────────────────────────
-    print("\n训练中...")
-    epochs = TRAINING.get("epochs", 150)
-    opt    = AdamW(
-        model.parameters(),
-        lr           = TRAINING.get("lr", 3e-4),
-        weight_decay = TRAINING.get("weight_decay", 1e-4),
-    )
-    sched = CosineAnnealingLR(opt, T_max=epochs,
-                               eta_min=TRAINING.get("lr", 3e-4) * 0.05)
-
-    save_path = TRAINING.get("save_path", "checkpoints/gwf_best.pt")
-    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-
-    best_r2   = -float("inf")
-    best_rmse = float("inf")
-
-    print(f"  {'Epoch':>5}  {'train_loss':>10}  {'val_RMSE':>9}  {'val_R²':>7}")
-    print(f"  {'-'*5}  {'-'*10}  {'-'*9}  {'-'*7}")
-
-    for epoch in range(1, epochs + 1):
+    for ep in range(1, epochs + 1):
         model.train()
-        losses = []
-        for batch in train_dl:
-            batch = {k: v.to(device) for k, v in batch.items()
-                     if isinstance(v, torch.Tensor)}
-            y_hat, _ = model(batch)
-            loss = F.mse_loss(y_hat, batch["y"])
+        t0, total_loss, nb = time.time(), 0.0, 0
+
+        for batch in train_loader:
+            coords = batch["coords"].to(device)
+            X_tab  = batch["X_tab"].to(device)
+            y      = batch["y"].to(device)
+            images = batch.get("image")
+            if images is not None:
+                images = images.to(device)
+
+            y_pred, aux = model(
+                coords=coords, X_tab=X_tab,
+                y=y, images=images, prompt_text=prompt,
+            )
+            loss, _ = loss_fn(y_pred, y, aux, phase=phase, epoch=ep)
 
             opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_norm=cfg_tr["grad_clip"],
+            )
             opt.step()
-            losses.append(loss.item())
+            total_loss += loss.item()
+            nb += 1
 
         sched.step()
+        avg_loss = total_loss / max(nb, 1)
+        elapsed  = time.time() - t0
 
-        # 每 10 轮或最后一轮打印
-        if epoch % 10 == 0 or epoch == 1 or epoch == epochs:
-            val_rmse, val_r2 = evaluate(model, val_dl, device)
-            train_loss = float(np.mean(losses))
-            marker = " ◀ best" if val_r2 > best_r2 else ""
-            print(f"  {epoch:5d}  {train_loss:10.4f}  {val_rmse:9.4f}  {val_r2:7.4f}{marker}")
+        metrics = evaluate(model, val_loader, device, prompt)
+        r2, rmse = metrics["R2"], metrics["RMSE"]
 
-            if val_r2 > best_r2:
-                best_r2   = val_r2
-                best_rmse = val_rmse
-                torch.save(model.state_dict(), save_path)
+        star = " ★" if r2 > best_r2 else ""
+        print(f"  Ph{phase}    {ep:>3}/{epochs:<3}  "
+              f"{avg_loss:>10.4f}    {rmse:>8.4f}    {r2:>7.4f}  "
+              f"{elapsed:>5.1f}s{star}")
 
-    # ── 4. 最终结果 ────────────────────────────────────────────────────────
-    print("\n[4/4] 最终评估...")
-    model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
-    val_rmse, val_r2 = evaluate(model, val_dl, device)
+        if r2 > best_r2:
+            best_r2 = r2
+            os.makedirs(Path(best_path).parent, exist_ok=True)
+            torch.save({
+                "phase": phase, "epoch": ep,
+                "model_state": model.state_dict(),
+                "val_R2": r2, "val_RMSE": rmse,
+            }, best_path)
 
-    print(f"\n{'─' * 40}")
-    print(f"  验证集 RMSE : {val_rmse:.4f}")
-    print(f"  验证集 R²   : {val_r2:.4f}")
-    print(f"  模型已保存  : {save_path}")
-    print(f"{'─' * 40}\n")
+    return best_r2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    cfg_data = config.DATA
+    cfg_enc  = config.ENCODERS
+    cfg_mod  = config.MODEL
+    cfg_loss = config.LOSS
+    cfg_tr   = config.TRAINING
+    cfg_path = config.PATHS
+
+    # Device
+    use_cuda = torch.cuda.is_available() and cfg_tr["device"] == "cuda"
+    device   = torch.device("cuda" if use_cuda else "cpu")
+    logger.info(f"Device: {device}")
+    torch.manual_seed(cfg_data["seed"])
+
+    # ── Prompt ─────────────────────────────────────────────────────────────
+    prompt = cfg_data.get("prompt_text", "")
+    key    = cfg_data.get("prompt_key", "")
+    if key and key in PROMPT_TEMPLATES:
+        prompt = PROMPT_TEMPLATES[key]
+    if not prompt:
+        prompt = PROMPT_TEMPLATES["generic"]
+
+    # ── Dataset ────────────────────────────────────────────────────────────
+    logger.info("Loading dataset...")
+    dataset = load_gwf_dataset(cfg_data, prompt_text=prompt)
+    logger.info(f"Dataset: N={len(dataset)}  features={dataset.X_tab.shape[1]}")
+
+    train_loader, val_loader = get_dataloaders(
+        dataset,
+        val_split=cfg_data["val_split"],
+        batch_size=cfg_tr["batch_size"],
+        seed=cfg_data["seed"],
+        num_workers=cfg_tr.get("num_workers", 0),
+    )
+
+    # ── Model ──────────────────────────────────────────────────────────────
+    logger.info("Building GWF model...")
+    merged_cfg = {
+        **cfg_enc,
+        **cfg_mod,
+        "device": cfg_enc.get("device", cfg_tr["device"]),
+    }
+    model = GWF(
+        cfg=merged_cfg,
+        num_targets=cfg_mod["num_targets"],
+        probabilistic=cfg_mod["probabilistic"],
+    ).to(device)
+
+    tot = sum(p.numel() for p in model.parameters())
+    logger.info(f"Total params: {tot:,}")
+
+    # ── Loss ───────────────────────────────────────────────────────────────
+    loss_fn = GWFLoss(
+        cfg=cfg_loss,
+        task=cfg_mod["task"],
+        probabilistic=cfg_mod["probabilistic"],
+    )
+
+    best_path = cfg_path["best_model_path"]
+    best_r2   = float("-inf")
+
+    # ── Training ───────────────────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("PHASE 1: Bridge Warm-up")
+    best_r2 = run_phase(1, model, train_loader, val_loader,
+                        loss_fn, cfg_tr, prompt, device, best_r2, best_path)
+
+    logger.info("=" * 60)
+    logger.info("PHASE 2: Joint Training")
+    best_r2 = run_phase(2, model, train_loader, val_loader,
+                        loss_fn, cfg_tr, prompt, device, best_r2, best_path)
+
+    if cfg_tr.get("phase3_epochs", 0) > 0:
+        logger.info("=" * 60)
+        logger.info("PHASE 3: Task Fine-tuning")
+        best_r2 = run_phase(3, model, train_loader, val_loader,
+                            loss_fn, cfg_tr, prompt, device, best_r2, best_path)
+
+    logger.info("=" * 60)
+    logger.info(f"Training complete.  Best val R² = {best_r2:.4f}")
+    logger.info(f"Best model saved → {best_path}")
+
 
 if __name__ == "__main__":
     main()
