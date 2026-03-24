@@ -55,7 +55,7 @@ DATA = {
 ENCODERS = {
     # ---- SatCLIP: satellite-level location encoder (REQUIRED) ----
     # Download: https://github.com/microsoft/satclip
-    "satclip_ckpt":  "",   # e.g. "/data/checkpoints/satclip-resnet18-l10.ckpt"
+    "satclip_ckpt":  "/root/.cache/satclip/satclip-resnet50-l10.ckpt",
 
     # ---- GeoCLIP: street-view location encoder (REQUIRED) ----
     # Weights are bundled in geoclip/model/weights/ — leave empty for auto-load
@@ -68,6 +68,7 @@ ENCODERS = {
     "anygraph_ckpt": "",   # leave empty → zero embeddings
 
     # ---- TabPFN: tabular encoder (REQUIRED) ----
+    # Downloaded via Google Storage fallback (storage.googleapis.com)
     "tabpfn_ckpt":   "/root/.cache/tabpfn/tabpfn-v2-regressor.ckpt",
 
     # ---- Text Embedding Encoder (REQUIRED) ----

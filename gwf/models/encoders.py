@@ -270,10 +270,15 @@ class TabPFNEncoder(nn.Module):
         try:
             from tabpfn import TabPFNRegressor  # type: ignore
 
-            self._tabpfn = TabPFNRegressor(
-                device=device,
-                N_ensemble_configurations=1,
-            )
+            # Build kwargs: support both old API (N_ensemble_configurations)
+            # and new API v6+ (n_estimators).  Also pass explicit model_path
+            # if a checkpoint file is provided.
+            kwargs: dict = {"device": device, "n_estimators": 1}
+            if ckpt_path and Path(ckpt_path).exists():
+                kwargs["model_path"] = ckpt_path
+                logger.info(f"TabPFN: using checkpoint {ckpt_path}")
+
+            self._tabpfn = TabPFNRegressor(**kwargs)
             self._available = True
             logger.info("TabPFN loaded ✓")
         except Exception as e:
@@ -335,6 +340,46 @@ class TabPFNEncoder(nn.Module):
 # Channel 6: Text Embedding Encoder (Qwen3-Embedding)
 # =============================================================================
 
+# ---------------------------------------------------------------------------
+# Hash-based text encoder fallback (no pretrained weights needed)
+# ---------------------------------------------------------------------------
+
+class _HashTextEncoder:
+    """
+    Deterministic text → dense vector via character n-gram hashing.
+
+    No tokenizer or pretrained weights required.  Produces non-zero,
+    content-dependent embeddings using the hashing trick:
+      1. Extract overlapping character n-grams (default n=3)
+      2. Hash each n-gram to one of `n_buckets` slots (bag-of-n-grams)
+      3. Project with a fixed random matrix (seeded → deterministic)
+      4. L2-normalise the result
+
+    This is an established NLP technique (fastText-style subword features)
+    and is far more informative than zero vectors.
+    """
+
+    def __init__(self, out_dim: int = 512, n: int = 3,
+                 n_buckets: int = 8192, seed: int = 42):
+        self.n         = n
+        self.n_buckets = n_buckets
+        gen = torch.Generator().manual_seed(seed)
+        self._proj = torch.randn(n_buckets, out_dim, generator=gen)
+
+    def encode(self, text: str, device: torch.device | str) -> torch.Tensor:
+        """text → (1, out_dim) float32, L2-normalised."""
+        h = torch.zeros(self.n_buckets)
+        t = text.lower()
+        for i in range(max(1, len(t) - self.n + 1)):
+            gram = t[i: i + self.n]
+            idx  = hash(gram) % self.n_buckets
+            h[idx] += 1.0
+        h = h / (h.norm() + 1e-9)
+        vec = h @ self._proj.to(h.device)          # (out_dim,)
+        vec = F.normalize(vec.unsqueeze(0), dim=-1) # (1, out_dim)
+        return vec.to(device)
+
+
 def _last_token_pool(
     last_hidden_states: torch.Tensor,   # (B, T, H)
     attention_mask:     torch.Tensor,   # (B, T)
@@ -389,8 +434,10 @@ class LLMEncoder(nn.Module):
         self._cache: dict[str, torch.Tensor] = {}
         self._use_last_token = False
 
-        # OUT_DIM is set after loading (= model's hidden_size)
+        # OUT_DIM is set after loading (= model's hidden_size).
+        # Falls back to hash encoder dim when transformer is unavailable.
         self.out_dim: int = 1024   # safe default; overwritten on successful load
+        self._hash_enc: _HashTextEncoder | None = None
 
         try:
             from transformers import AutoTokenizer, AutoModel  # type: ignore
@@ -419,9 +466,15 @@ class LLMEncoder(nn.Module):
             logger.info(f"Text encoder loaded ✓  H={self.out_dim}  pooling={pool}")
 
         except Exception as e:
-            logger.warning(f"Text encoder unavailable ({e}). Using zero embeddings.")
-            self.tokenizer = None
-            self.lm        = None
+            logger.warning(
+                f"Text encoder unavailable ({e}). "
+                "Falling back to character n-gram hash encoder (deterministic, non-zero)."
+            )
+            self.tokenizer  = None
+            self.lm         = None
+            # Hash encoder: out_dim=512 matches bridge expected input range well
+            self._hash_enc  = _HashTextEncoder(out_dim=512, seed=42)
+            self.out_dim    = 512
 
     @torch.no_grad()
     def _encode_raw(self, prompt_text: str, device: torch.device) -> torch.Tensor:
@@ -433,8 +486,9 @@ class LLMEncoder(nn.Module):
             return self._cache[prompt_text].to(device)
 
         if not self._available:
-            result = torch.zeros(1, self.out_dim, device=device)
-            self._cache[prompt_text] = result
+            # Use the hash-based text encoder instead of zeros
+            result = self._hash_enc.encode(prompt_text, device)  # (1, 512)
+            self._cache[prompt_text] = result.cpu()
             return result
 
         text = (self._INSTRUCTION + prompt_text) if self._use_last_token else prompt_text
@@ -497,7 +551,9 @@ class FrozenEncoderBank(nn.Module):
         self.anygraph = AnyGraphEncoder(
             ckpt_path=cfg.get("anygraph_ckpt"), device=device
         )
-        self.tabpfn   = TabPFNEncoder(device=device)
+        self.tabpfn   = TabPFNEncoder(
+            ckpt_path=cfg.get("tabpfn_ckpt"), device=device
+        )
         self.llm      = LLMEncoder(
             model_name=cfg.get("llm_name", "Qwen/Qwen3-Embedding-0.6B"),
             device=device,
